@@ -1,0 +1,3346 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <link rel="manifest" href="./manifest.json">
+  <meta name="theme-color" content="#1e293b">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="KerjaKu">
+  <link rel="apple-touch-icon" href="./icons/icon-192.png">
+  <title>Aplikasi Catatan Pekerjaan & Pengeluaran Terstruktur</title>
+  
+  <!-- CDN SheetJS (Excel) -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <!-- CDN jsPDF & jsPDF-AutoTable (PDF) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
+
+  <!-- Firebase SDK (Modular CDN) -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+    import { getDatabase, ref, push, set, onValue, remove, update, get } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-database.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyDS6SUH86CiVSsMt0igEDoFv_8YT-iPWV4",
+      authDomain: "working-record-2b952.firebaseapp.com",
+      databaseURL: "https://working-record-2b952-default-rtdb.asia-southeast1.firebasedatabase.app",
+      projectId: "working-record-2b952",
+      storageBucket: "working-record-2b952.firebasestorage.app",
+      messagingSenderId: "1065000037805",
+      appId: "1:1065000037805:web:296a828b18408d7afa4524",
+      measurementId: "G-5XFJ6N67J3"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    window.db = db;
+    window.dbRef = ref;
+    window.dbPush = push;
+
+    // KerjaKu offline support: local cache for main RTDB branches + queued writes.
+    const KK_CACHE_PREFIX = 'kerjaKu_rtdb_cache_v1:';
+    const KK_QUEUE_KEY = 'kerjaKu_rtdb_queue_v1';
+    const KK_ROOTS = new Set(['users', 'jobs', 'expenses', 'personalJobs', 'folderStatuses', 'capitals']);
+    const kkListeners = new Map();
+
+    function kkPath(r) {
+      try {
+        const u = new URL(r.toString());
+        return decodeURIComponent(u.pathname.replace(/\.json$/, '').split('/').filter(Boolean).join('/'));
+      } catch (_) { return ''; }
+    }
+    function kkParts(path) { return String(path || '').split('/').filter(Boolean); }
+    function kkRoot(path) { return kkParts(path)[0] || ''; }
+    function kkReadRoot(root) {
+      try { return JSON.parse(localStorage.getItem(KK_CACHE_PREFIX + root) || 'null'); }
+      catch (_) { return null; }
+    }
+    function kkWriteRoot(root, value) {
+      try { localStorage.setItem(KK_CACHE_PREFIX + root, JSON.stringify(value)); }
+      catch (e) { console.warn('Cache offline KerjaKu tidak dapat disimpan:', e); }
+    }
+    function kkAt(data, parts) {
+      let node = data;
+      for (const part of parts) {
+        if (node == null || typeof node !== 'object') return null;
+        node = node[part];
+      }
+      return node === undefined ? null : node;
+    }
+    function kkWriteAt(data, parts, value, removeValue = false, mergeValue = false) {
+      if (!parts.length) return removeValue ? null : value;
+      const rootData = data && typeof data === 'object' ? data : {};
+      let cursor = rootData;
+      for (let i = 0; i < parts.length - 1; i++) {
+        const key = parts[i];
+        if (!cursor[key] || typeof cursor[key] !== 'object') cursor[key] = {};
+        cursor = cursor[key];
+      }
+      const key = parts[parts.length - 1];
+      if (removeValue) delete cursor[key];
+      else if (mergeValue && value && typeof value === 'object') {
+        cursor[key] = { ...(cursor[key] && typeof cursor[key] === 'object' ? cursor[key] : {}), ...value };
+      } else cursor[key] = value;
+      return rootData;
+    }
+    function kkNotify(root) {
+      const listeners = kkListeners.get(root);
+      if (!listeners) return;
+      const data = kkReadRoot(root);
+      for (const item of listeners) {
+        try { item.callback({ val: () => kkAt(data, kkParts(item.path).slice(1)) }); }
+        catch (e) { console.error(e); }
+      }
+    }
+    function kkCachePath(path, value, mode = 'set') {
+      const parts = kkParts(path), root = parts[0];
+      if (!KK_ROOTS.has(root)) return;
+      let data = kkReadRoot(root);
+      if (data === null) data = {};
+      data = kkWriteAt(data, parts.slice(1), value, mode === 'remove', mode === 'update');
+      kkWriteRoot(root, data);
+      kkNotify(root);
+    }
+    function kkQueueRead() {
+      try { return JSON.parse(localStorage.getItem(KK_QUEUE_KEY) || '[]'); }
+      catch (_) { return []; }
+    }
+    function kkQueueSave(queue) {
+      try { localStorage.setItem(KK_QUEUE_KEY, JSON.stringify(queue)); }
+      catch (e) { console.error('Antrean offline tidak bisa disimpan:', e); }
+      window.dispatchEvent(new CustomEvent('kerjaku-offline-queue', { detail: { pending: queue.length } }));
+    }
+    function kkEnqueue(op) {
+      const queue = kkQueueRead();
+      queue.push({ ...op, queuedAt: Date.now() });
+      kkQueueSave(queue);
+    }
+    function kkSnapshot(value) { return { val: () => value == null ? null : value }; }
+
+    window.dbSet = async (targetRef, value) => {
+      const path = kkPath(targetRef);
+      if (!navigator.onLine) {
+        kkCachePath(path, value); kkEnqueue({ type: 'set', path, value }); return;
+      }
+      try { await set(targetRef, value); kkCachePath(path, value); }
+      catch (error) {
+        kkCachePath(path, value); kkEnqueue({ type: 'set', path, value });
+        console.warn('Set disimpan lokal, menunggu internet:', error);
+      }
+    };
+    window.dbUpdate = async (targetRef, value) => {
+      const path = kkPath(targetRef);
+      if (!navigator.onLine) {
+        kkCachePath(path, value, 'update'); kkEnqueue({ type: 'update', path, value }); return;
+      }
+      try { await update(targetRef, value); kkCachePath(path, value, 'update'); }
+      catch (error) {
+        kkCachePath(path, value, 'update'); kkEnqueue({ type: 'update', path, value });
+        console.warn('Update disimpan lokal, menunggu internet:', error);
+      }
+    };
+    window.dbRemove = async (targetRef) => {
+      const path = kkPath(targetRef);
+      if (!navigator.onLine) {
+        kkCachePath(path, null, 'remove'); kkEnqueue({ type: 'remove', path }); return;
+      }
+      try { await remove(targetRef); kkCachePath(path, null, 'remove'); }
+      catch (error) {
+        kkCachePath(path, null, 'remove'); kkEnqueue({ type: 'remove', path });
+        console.warn('Penghapusan disimpan lokal, menunggu internet:', error);
+      }
+    };
+    window.dbGet = async (targetRef) => {
+      const path = kkPath(targetRef);
+      try {
+        const snap = await get(targetRef);
+        const root = kkRoot(path);
+        if (KK_ROOTS.has(root)) {
+          let data = kkReadRoot(root); if (data === null) data = {};
+          data = kkWriteAt(data, kkParts(path).slice(1), snap.val());
+          kkWriteRoot(root, data);
+        }
+        return snap;
+      } catch (error) {
+        const root = kkRoot(path), data = kkReadRoot(root);
+        if (!KK_ROOTS.has(root) || data === null) throw error;
+        return kkSnapshot(kkAt(data, kkParts(path).slice(1)));
+      }
+    };
+    window.dbOnValue = (targetRef, callback, ...args) => {
+      const path = kkPath(targetRef), root = kkRoot(path);
+      if (KK_ROOTS.has(root)) {
+        if (!kkListeners.has(root)) kkListeners.set(root, new Set());
+        kkListeners.get(root).add({ path, callback });
+        const cached = kkReadRoot(root);
+        if (cached !== null) queueMicrotask(() => {
+          try { callback(kkSnapshot(kkAt(cached, kkParts(path).slice(1)))); }
+          catch (e) { console.error(e); }
+        });
+      }
+      return onValue(targetRef, snap => {
+        if (KK_ROOTS.has(root)) {
+          let data = kkReadRoot(root); if (data === null) data = {};
+          data = kkWriteAt(data, kkParts(path).slice(1), snap.val());
+          kkWriteRoot(root, data);
+        }
+        callback(snap);
+      }, ...args);
+    };
+
+    let kkReplaying = false;
+    async function kkReplayQueue() {
+      if (kkReplaying || !navigator.onLine) return;
+      kkReplaying = true;
+      try {
+        const queue = kkQueueRead(), remaining = [];
+        for (let i = 0; i < queue.length; i++) {
+          const op = queue[i];
+          try {
+            const targetRef = ref(db, op.path);
+            if (op.type === 'set') await set(targetRef, op.value);
+            else if (op.type === 'update') await update(targetRef, op.value);
+            else if (op.type === 'remove') await remove(targetRef);
+          } catch (_) { remaining.push(...queue.slice(i)); break; }
+        }
+        kkQueueSave(remaining);
+      } finally { kkReplaying = false; }
+    }
+    window.addEventListener('online', kkReplayQueue);
+    window.addEventListener('load', kkReplayQueue);
+    setInterval(kkReplayQueue, 15000);
+    window.kerjaKuOffline = { pendingCount: () => kkQueueRead().length, isOnline: () => navigator.onLine };
+  </script>
+
+  <style>
+    :root {
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --border: #e2e8f0;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+      --success: #10b981;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 12px;
+    }
+
+    .login-overlay {
+      position: fixed;
+      top: 0; left: 0; width: 100%; height: 100%;
+      background: #0f172a;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      padding: 16px;
+    }
+
+    .login-card {
+      background: #ffffff;
+      border-radius: 12px;
+      padding: 28px 24px;
+      width: 100%;
+      max-width: 400px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+      text-align: center;
+    }
+
+    .login-logo {
+      font-size: 40px;
+      margin-bottom: 8px;
+    }
+
+    .login-title {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+
+    .login-subtitle {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-bottom: 20px;
+    }
+
+    .app-container {
+      width: 100%;
+      max-width: 980px;
+      background: var(--card-bg);
+      border-radius: 12px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 85vh;
+      position: relative;
+    }
+
+    .top-header {
+      background: #1e293b;
+      color: #ffffff;
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 2px solid var(--border);
+    }
+
+    .header-title-box {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .hamburger-btn {
+      background: none;
+      border: none;
+      color: #ffffff;
+      font-size: 24px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .app-title-text {
+      font-size: 1.1rem;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+
+    .sidebar-overlay {
+      position: fixed;
+      top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0, 0, 0, 0.5);
+      display: none;
+      z-index: 100;
+    }
+
+    .sidebar-overlay.active { display: block; }
+
+    .sidebar {
+      position: fixed;
+      top: 0; left: -280px; width: 280px; height: 100%;
+      background: #0f172a;
+      color: #f8fafc;
+      transition: all 0.3s ease;
+      z-index: 101;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 4px 0 15px rgba(0,0,0,0.3);
+    }
+
+    .sidebar.active { left: 0; }
+
+    .sidebar-header {
+      padding: 20px;
+      background: #1e293b;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #334155;
+    }
+
+    .sidebar-header h3 { font-size: 1.1rem; color: #ffffff; }
+
+    .close-sidebar-btn {
+      background: none;
+      border: none;
+      color: #94a3b8;
+      font-size: 20px;
+      cursor: pointer;
+    }
+
+    .sidebar-menu {
+      display: flex;
+      flex-direction: column;
+      padding: 12px 0;
+      flex: 1;
+    }
+
+    .sidebar-item {
+      padding: 14px 20px;
+      color: #cbd5e1;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      transition: background 0.2s;
+    }
+
+    .sidebar-item:hover { background: #1e293b; color: #ffffff; }
+    .sidebar-item.active { background: var(--primary); color: #ffffff; }
+    .sidebar-item.active-expense { background: var(--danger); color: #ffffff; }
+
+    .tab-content { display: none; padding: 20px; flex: 1; }
+    .tab-content.active { display: block; }
+
+    h2 { font-size: 1.25rem; margin-bottom: 20px; color: var(--text); }
+
+    .dashboard-metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .metric-card {
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+    }
+
+    .metric-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .metric-value { font-size: 22px; font-weight: 800; }
+
+    .recent-activity-card {
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+    }
+
+    .user-profile-card {
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      text-align: center;
+      max-width: 450px;
+      margin: 0 auto;
+    }
+
+    .avatar-circle {
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      background: var(--primary);
+      color: white;
+      font-size: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 16px;
+      font-weight: bold;
+    }
+
+    .user-info-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 14px;
+    }
+
+    .form-group { margin-bottom: 18px; text-align: left; }
+    label { display: block; margin-bottom: 6px; font-weight: 600; font-size: 14px; color: #334155; }
+
+    input, select, textarea {
+      width: 100%;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 15px;
+      background-color: #fff;
+    }
+
+    input[type="file"] { padding: 8px; background: #f1f5f9; cursor: pointer; }
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+    }
+
+    textarea { resize: vertical; min-height: 90px; }
+
+    .img-preview-container { margin-top: 8px; display: none; }
+    .img-preview { max-width: 120px; max-height: 120px; border-radius: 6px; border: 1px solid var(--border); object-fit: cover; }
+
+    .btn-submit {
+      width: 100%;
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      padding: 14px;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 8px;
+    }
+
+    .btn-submit:hover { background: var(--primary-hover); }
+    .btn-expense { background: var(--danger); }
+    .btn-expense:hover { background: #dc2626; }
+    .btn-cancel { background: #64748b; margin-top: 8px; }
+
+    .btn-link {
+      background: none;
+      border: none;
+      color: var(--primary);
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: underline;
+      font-size: 13px;
+    }
+
+    .modal-input-card {
+      background: #f0fdf4;
+      border: 1px solid #bbf7d0;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 18px;
+    }
+
+    .folder-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+    }
+
+    .folder-card {
+      background: #f8fafc;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .folder-card:hover {
+      background: #eff6ff;
+      border-color: var(--primary);
+      transform: translateY(-2px);
+    }
+
+    .folder-card.expense-card:hover { background: #fef2f2; border-color: var(--danger); }
+    .folder-card.folder-processed { background: #f1f5f9; border-color: #cbd5e1; }
+    .folder-card.folder-processed:hover { background: #e2e8f0; border-color: #94a3b8; }
+    .folder-card.folder-processed .folder-icon { filter: grayscale(1); opacity: 0.55; }
+    .folder-icon { font-size: 38px; margin-bottom: 8px; }
+    .folder-title { font-weight: 600; font-size: 16px; color: var(--text); word-break: break-word; }
+    .folder-count { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+    .folder-status-badge { display:inline-block; margin-top:8px; padding:4px 9px; border-radius:999px; font-size:11px; font-weight:800; }
+    .folder-status-badge.pending { background:#fef3c7; color:#92400e; }
+    .folder-status-badge.processed { background:#e2e8f0; color:#475569; }
+    .folder-status-btn { margin-top:8px; width:100%; border:1px solid #cbd5e1; background:#fff; color:#475569; padding:7px 9px; border-radius:7px; cursor:pointer; font-weight:700; font-size:12px; }
+    .folder-status-btn:hover { background:#f1f5f9; }
+
+    .dashboard-status-section { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin-bottom:24px; }
+    .status-metric-card { border:1px solid var(--border); border-radius:10px; padding:18px; background:#fff; box-shadow:0 2px 8px rgba(0,0,0,.04); }
+    .status-metric-card.processed { border-left:5px solid #64748b; }
+    .status-metric-card.pending { border-left:5px solid var(--warning); }
+    .status-metric-title { font-size:12px; font-weight:800; color:var(--text-muted); text-transform:uppercase; margin-bottom:6px; }
+    .status-metric-value { font-size:24px; font-weight:800; color:var(--text); }
+    .personal-pending-list { list-style:none; margin:0; padding:0; }
+    .personal-pending-list li { padding:10px 0; border-bottom:1px dashed var(--border); display:flex; justify-content:space-between; gap:12px; align-items:center; }
+    .personal-pending-list li:last-child { border-bottom:none; }
+    .pending-job-name { font-weight:700; color:var(--text); }
+    .pending-job-count { font-size:12px; color:var(--text-muted); white-space:nowrap; }
+    @media (max-width:700px) { .dashboard-status-section { grid-template-columns:1fr; } }
+
+    .total-badge {
+      display: inline-block;
+      margin-top: 6px;
+      padding: 4px 8px;
+      background: #fee2e2;
+      color: #991b1b;
+      font-weight: 700;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+
+    .capital-badge {
+      display: inline-block;
+      margin-top: 4px;
+      padding: 3px 8px;
+      background: #dcfce7;
+      color: #166534;
+      font-weight: 700;
+      border-radius: 6px;
+      font-size: 11px;
+    }
+
+    .btn-delete-folder {
+      margin-top: 12px;
+      background: #fee2e2;
+      color: var(--danger);
+      border: 1px solid #fca5a5;
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 12px;
+      transition: all 0.2s ease;
+    }
+
+    .btn-delete-folder:hover { background: var(--danger); color: #ffffff; }
+
+    .controls-panel {
+      background: #f1f5f9;
+      padding: 16px;
+      border-radius: 12px;
+      margin-bottom: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .btn-back {
+      background: #253342;
+      color: #fff;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 14px;
+      align-self: flex-start;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .folder-header-title { font-size: 1.3rem; font-weight: 700; color: #0f172a; }
+
+    .filter-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: #ffffff;
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+
+    .filter-label {
+      font-size: 14px;
+      font-weight: 600;
+      color: #475569;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      min-width: 80px;
+    }
+
+    .filter-select {
+      border: none;
+      padding: 4px 6px;
+      font-size: 14px;
+      background: transparent;
+      outline: none;
+      width: 100%;
+    }
+
+    .export-buttons { display: flex; gap: 10px; margin-top: 4px; }
+
+    .btn-export {
+      flex: 1;
+      padding: 10px;
+      border: none;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      color: #fff;
+      transition: opacity 0.2s ease;
+    }
+
+    .btn-export:hover { opacity: 0.9; }
+    .btn-export-excel { background-color: #10b981; }
+    .btn-export-pdf { background-color: #ef4444; }
+
+    .card-list-container { display: flex; flex-direction: column; gap: 12px; }
+
+    /* Tabel grid data pekerjaan */
+    .job-table-wrapper {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fff;
+    }
+
+    .job-table {
+      width: 100%;
+      min-width: 900px;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    .job-table th, .job-table td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      border-right: 1px solid var(--border);
+      vertical-align: middle;
+      text-align: left;
+    }
+
+    .job-table th:last-child, .job-table td:last-child { border-right: none; }
+    .job-table th {
+      background: #f8fafc;
+      color: var(--text);
+      font-weight: 700;
+      white-space: nowrap;
+      text-align: center;
+    }
+    .job-table tbody tr:last-child td { border-bottom: none; }
+    .job-table tbody tr:hover { background: #f8fafc; }
+    .job-table .col-no { width: 52px; text-align: center; }
+    .job-table .col-photo { width: 90px; text-align: center; }
+    .job-table .col-date, .job-table .col-time { white-space: nowrap; text-align: center; }
+    .job-table .col-action { width: 150px; white-space: nowrap; text-align: center; }
+    .job-table .job-photo-empty { color: #94a3b8; font-style: italic; }
+    .job-table .job-action { display: flex; gap: 6px; justify-content: center; }
+    .job-table .job-action button {
+      border: none; border-radius: 6px; padding: 7px 9px; cursor: pointer;
+      font-weight: 600; font-size: 12px;
+    }
+
+    @media (max-width: 700px) {
+      .job-table { min-width: 780px; }
+      .job-table th, .job-table td { padding: 8px 9px; }
+    }
+
+    .data-card {
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.03);
+    }
+
+    .data-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #f1f5f9;
+    }
+
+    .data-card-num { font-weight: 700; color: var(--text-muted); font-size: 13px; }
+
+    .data-card-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      font-size: 14px;
+    }
+
+    .data-card-label { color: var(--text-muted); font-weight: 500; }
+    .data-card-value { font-weight: 600; color: var(--text); text-align: right; }
+
+    .data-card-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px dashed var(--border);
+    }
+
+    .data-card-actions button {
+      flex: 1;
+      padding: 8px;
+      border: none;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .table-wrapper {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    th, td {
+      padding: 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 14px;
+      vertical-align: middle;
+    }
+
+    th { background-color: #f8fafc; color: #475569; font-weight: 600; font-size: 13px; }
+
+    .doc-thumb {
+      width: 45px;
+      height: 45px;
+      object-fit: cover;
+      border-radius: 6px;
+      cursor: pointer;
+      border: 1px solid var(--border);
+    }
+
+    .amount-text { font-weight: 700; color: var(--danger); }
+    .action-btns { display: flex; gap: 6px; }
+
+    .btn-edit {
+      background: #fef3c7;
+      color: #d97706;
+      border: none;
+      padding: 6px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 12px;
+    }
+
+    .btn-delete {
+      background: #fee2e2;
+      color: var(--danger);
+      border: none;
+      padding: 6px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 12px;
+    }
+
+    .empty-msg {
+      text-align: center;
+      color: var(--text-muted);
+      padding: 40px 20px;
+      font-size: 15px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .summary-box {
+      padding: 14px;
+      background: #f8fafc;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .summary-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+    }
+
+    .summary-value { font-size: 16px; font-weight: 700; }
+
+    .text-success { color: var(--success); }
+    .text-danger { color: var(--danger); }
+    .text-primary { color: var(--primary); }
+
+    .modal {
+      display: none;
+      position: fixed;
+      z-index: 1000;
+      top: 0; left: 0; width: 100%; height: 100%;
+      background-color: rgba(0, 0, 0, 0.75);
+      justify-content: center;
+      align-items: center;
+      padding: 16px;
+    }
+
+    .modal-content {
+      max-width: 90%;
+      max-height: 80vh;
+      border-radius: 8px;
+      object-fit: contain;
+    }
+
+    .modal-close {
+      position: absolute;
+      top: 20px; right: 25px;
+      color: #fff;
+      font-size: 32px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    .form-modal-box{background:#fff;border-radius:12px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto;padding:22px;box-shadow:0 10px 30px rgba(0,0,0,.25);text-align:left}.form-modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;position:sticky;top:-22px;background:#fff;padding-top:2px;z-index:2}.form-modal-header h3{font-size:18px;color:var(--text)}.form-modal-close{border:none;background:#f1f5f9;color:#475569;width:34px;height:34px;border-radius:50%;font-size:22px;cursor:pointer}.folder-input-buttons{display:flex;gap:8px;width:100%;margin-top:12px}.folder-input-buttons button{flex:1;border:none;padding:9px 8px;border-radius:7px;font-weight:700;cursor:pointer;font-size:12px}.btn-folder-job{background:#dbeafe;color:#1d4ed8}.btn-folder-expense{background:#fee2e2;color:#b91c1c}
+
+    .confirm-modal-box {
+      background: #ffffff;
+      border-radius: 12px;
+      max-width: 420px;
+      width: 100%;
+      padding: 24px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+      text-align: center;
+    }
+
+    .confirm-modal-icon { font-size: 48px; margin-bottom: 12px; }
+    .confirm-modal-title { font-size: 18px; font-weight: 700; color: #0f172a; margin-bottom: 8px; }
+    .confirm-modal-desc { font-size: 14px; color: #475569; margin-bottom: 16px; }
+
+    .warning-box {
+      background-color: #fef2f2;
+      border: 1px solid #fca5a5;
+      color: #991b1b;
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 20px;
+    }
+
+    .confirm-modal-actions { display: flex; gap: 10px; }
+    .btn-modal-cancel {
+      flex: 1; padding: 10px; border: 1px solid var(--border);
+      background: #f1f5f9; color: #334155; border-radius: 6px; font-weight: 600; cursor: pointer;
+    }
+    .btn-modal-confirm {
+      flex: 1; padding: 10px; border: none;
+      background: var(--danger); color: #ffffff; border-radius: 6px; font-weight: 600; cursor: pointer;
+    }
+
+    .user-table-row { cursor: pointer; transition: background 0.2s; }
+    .user-table-row:hover { background-color: #f1f5f9; }
+
+    @media (max-width: 640px) {
+      body { padding: 0; }
+      .app-container { border-radius: 0; min-height: 100vh; }
+      .tab-content { padding: 12px; }
+      th, td { padding: 8px 10px; font-size: 12px; }
+      .doc-thumb { width: 36px; height: 36px; }
+      .export-buttons { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- OVERLAY LAYAR LOGIN -->
+<div class="login-overlay" id="loginScreen">
+  <div class="login-card">
+    <div class="login-logo">🔒</div>
+    <div class="login-title">KerjaKu Login</div>
+    <div class="login-subtitle">Masukkan akun dan kata sandi Anda</div>
+
+    <form id="loginForm">
+      <div class="form-group">
+        <label for="loginUserSelect">Pilih User</label>
+        <select id="loginUserSelect" required>
+          <option value="">-- Memuat Daftar User --</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="loginPassword">Kata Sandi (Password)</label>
+        <input type="password" id="loginPassword" required placeholder="Masukkan kata sandi...">
+      </div>
+      <div id="loginErrorMsg" style="color: var(--danger); font-size: 13px; margin-bottom: 12px; display: none; font-weight: 600;">
+        ❌ Kata sandi salah!
+      </div>
+      <button type="submit" class="btn-submit">Masuk Aplikasi</button>
+      <div style="margin-top: 16px;">
+        <span style="font-size: 13px; color: var(--text-muted);">Belum punya akun? </span>
+        <button type="button" class="btn-link" onclick="openRegisterModal()">Daftar Akun Baru</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- OVERLAY LAYAR REGISTRASI -->
+<div class="login-overlay" id="registerScreen" style="display: none;">
+  <div class="login-card">
+    <div class="login-logo">📝</div>
+    <div class="login-title">Registrasi Akun Baru</div>
+    <div class="login-subtitle">Isi data akun Anda di bawah ini</div>
+
+    <form id="registerForm" onsubmit="handleRegister(event)">
+      <div class="form-group">
+        <label for="regUserName">Nama Lengkap User</label>
+        <input type="text" id="regUserName" required placeholder="Contoh: Ahmad Rizki">
+      </div>
+      <div class="form-group">
+        <label for="regUserPassword">Kata Sandi (Password)</label>
+        <input type="password" id="regUserPassword" required placeholder="Buat kata sandi akun...">
+      </div>
+      <div class="form-group">
+        <label for="regUserRole">Peran (Role)</label>
+        <select id="regUserRole" required>
+          <option value="Teknisi / Lapangan">Teknisi / Lapangan</option>
+          <option value="Administrasi">Administrasi</option>
+          <option value="Administrator" id="adminRoleOption" disabled>Administrator</option>
+        </select>
+        <div id="firstUserNotice" style="display: none; color: var(--primary); font-size: 12px; margin-top: 6px; font-weight: 600; text-align: left;">
+          ℹ️ Anda pendaftar pertama! Akun akan otomatis dijadikan Administrator.
+        </div>
+        <div id="subsequentUserNotice" style="display: none; color: var(--text-muted); font-size: 12px; margin-top: 6px; text-align: left;">
+          ℹ️ Akses Administrator hanya dapat diberikan oleh Admin Utama melalui Dashboard Admin.
+        </div>
+      </div>
+      <button type="submit" class="btn-submit">Daftar Sekarang</button>
+      <button type="button" class="btn-submit btn-cancel" onclick="closeRegisterModal()">Batal</button>
+    </form>
+  </div>
+</div>
+
+<div class="app-container">
+  <!-- Top Bar Navigation Header -->
+  <div class="top-header">
+    <div class="header-title-box">
+      <button class="hamburger-btn" onclick="toggleSidebar()">☰</button>
+      <span class="app-title-text" id="topPageTitle">Dashboard</span>
+    </div>
+  </div>
+
+  <!-- Sidebar Drawer Navigation -->
+  <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <h3>Menu KerjaKu</h3>
+      <button class="close-sidebar-btn" onclick="toggleSidebar()">✕</button>
+    </div>
+    <div class="sidebar-menu">
+      <div class="sidebar-item" id="menuDashboard" onclick="switchTab('dashboard-page')">
+        📊 Dashboard Utama
+      </div>
+      <!-- Menu Khusus User Biasa -->
+      <div class="sidebar-item user-menu-item" id="menuJobList" onclick="switchTab('job-list-page')">
+        📁 Folder Kerja
+      </div>
+      <div class="sidebar-item user-menu-item" id="menuPersonalJobList" onclick="switchTab('personal-job-list-page')">
+        🧰 Folder Kerja Pribadi
+      </div>
+      <div class="sidebar-item user-menu-item" id="menuExpList" onclick="switchTab('expense-list-page')">
+        📊 Folder Pengeluaran
+      </div>
+      <div class="sidebar-item" id="menuUser" onclick="switchTab('user-page')">
+        👤 User / Profil
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB DASHBOARD UTAMA -->
+  <div id="dashboard-page" class="tab-content">
+    <h2 id="dashboardHeading">Ringkasan Aplikasi</h2>
+    
+    <div class="dashboard-status-section" id="dashboardStatusGrid">
+      <div class="status-metric-card processed">
+        <div class="status-metric-title">FOLDER KERJA SUDAH DIPROSES</div>
+        <div id="dashJobsProcessed" class="status-metric-value">0 Data</div>
+      </div>
+      <div class="status-metric-card pending">
+        <div class="status-metric-title">FOLDER KERJA BELUM DIPROSES</div>
+        <div id="dashJobsPending" class="status-metric-value">0 Data</div>
+      </div>
+      <div class="status-metric-card processed">
+        <div class="status-metric-title">TOTAL PENGELUARAN SUDAH DIPROSES</div>
+        <div id="dashExpensesProcessed" class="status-metric-value">0 Data</div>
+      </div>
+      <div class="status-metric-card pending">
+        <div class="status-metric-title">TOTAL PENGELUARAN BELUM DIPROSES</div>
+        <div id="dashExpensesPending" class="status-metric-value">0 Data</div>
+      </div>
+    </div>
+
+    <!-- HANYA MENAMPILKAN DAFTAR USER & RINGKASAN UNTUK ADMIN -->
+    <div class="recent-activity-card" id="adminUserSection" style="margin-top: 20px; display: none;">
+      <h3 style="font-size: 16px; margin-bottom: 6px;">👥 Dashboard Admin - Daftar User Terdaftar</h3>
+      <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Klik pada nama user untuk melihat tabel rinci mengenai pekerjaan dan pengeluaran spesifik user tersebut.</p>
+      
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>No</th>
+              <th>Nama User</th>
+              <th>Role / Peran</th>
+              <th>Tanggal Daftar</th>
+              <th>Akses Admin</th>
+              <th>Aksi</th>
+            </tr>
+          </thead>
+          <tbody id="userTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- RINCIAN PER USER KHUSUS ADMIN. TIDAK MEMUAT FOLDER KERJA PRIBADI. -->
+    <div class="recent-activity-card" id="adminUserDetailsSection" style="margin-top: 20px; display: none;">
+      <h3 style="font-size: 16px; margin-bottom: 6px;">📋 Rincian Data Masing-Masing User</h3>
+      <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Ringkasan Folder Kerja dan Pengeluaran setiap user. Data Folder Kerja Pribadi tidak ditampilkan pada Dashboard Admin.</p>
+      <div id="adminUserDetailsList" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:14px;"></div>
+    </div>
+
+    <!-- Pekerjaan Pribadi yang Belum Diproses -->
+    <div class="recent-activity-card" id="personalPendingSection" style="margin-top: 20px;">
+      <h3 style="font-size: 16px; margin-bottom: 6px; color: var(--text);">🧰 Pekerjaan Pribadi Belum Diproses</h3>
+      <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 10px;">Semua nama pekerjaan dari Folder Kerja Pribadi yang status foldernya masih belum diproses.</p>
+      <div id="personalPendingList" style="font-size: 14px; color: var(--text-muted);">Belum ada pekerjaan pribadi yang belum diproses.</div>
+    </div>
+
+  </div>
+
+  <!-- TAB USER / PROFIL & MANAJEMEN AKUN -->
+  <div id="user-page" class="tab-content">
+    <h2>Profil Pengguna</h2>
+    <div class="user-profile-card">
+      <div class="avatar-circle" id="userAvatar">K</div>
+      <h3 style="margin-bottom: 4px;" id="userNameProfile">User KerjaKu</h3>
+      <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 20px;" id="userRoleProfile">Teknisi / Lapangan</p>
+
+      <div class="user-info-row">
+        <span style="color: var(--text-muted);">Status Akun:</span>
+        <span style="font-weight: 600; color: var(--success);">● Terhubung (Ingat Perangkat)</span>
+      </div>
+      <div class="user-info-row">
+        <span style="color: var(--text-muted);">Database:</span>
+        <span style="font-weight: 600;">Firebase RTDB (Per-User Grouping)</span>
+      </div>
+
+      <button class="btn-submit btn-expense" style="margin-top: 24px;" onclick="logout()">
+        🚪 Keluar (Logout)
+      </button>
+    </div>
+  </div>
+
+  <!-- TAB 2: Folder Kerja -->
+  <div id="job-list-page" class="tab-content">
+    <div id="folderJobView">
+      <h2>Folder Kerja</h2>
+      <div id="folderJobGrid" class="folder-grid"></div>
+      <div id="emptyFolderJobMsg" class="empty-msg" style="display: none;">
+        <div>Belum ada folder/data pekerjaan.</div>
+        <div style="margin-top: 14px;">Silakan input pekerjaan baru untuk membuat folder jenis pekerjaan.</div>
+        <button class="btn-folder-job" style="margin-top: 18px; padding: 12px 22px; font-size: 14px;" onclick="openJobInputModal('')">➕ Input Data Pekerjaan</button>
+      </div>
+    </div>
+
+    <div id="detailJobView" style="display: none;">
+      <div class="controls-panel">
+        <button class="btn-back" onclick="closeJobDetail()">⬅️ Kembali ke Folder</button>
+        <div class="folder-header-title" id="selectedJobFolderName">Folder: -</div>
+        <div class="folder-input-buttons" style="margin: 12px 0 16px;">
+          <button class="btn-folder-job" style="padding: 12px; font-size: 14px;" onclick="openJobInputModal(activeJobFolderNama)">➕ Input Data Pekerjaan</button>
+        </div>
+        
+        <div class="filter-row">
+          <span class="filter-label">🛠️ Filter:</span>
+          <select id="jobJenisFilter" class="filter-select" onchange="renderJobCards()">
+            <option value="ALL">Semua Jenis Pekerjaan</option>
+          </select>
+        </div>
+
+        <div class="filter-row">
+          <span class="filter-label">📅 Tanggal:</span>
+          <select id="jobSortOrder" class="filter-select" onchange="renderJobCards()">
+            <option value="DESC">Terbaru → Terlama</option>
+            <option value="ASC">Terlama → Terbaru</option>
+          </select>
+        </div>
+
+        <div class="export-buttons">
+          <button class="btn-export btn-export-excel" onclick="exportJobToExcel()">📊 Export Excel</button>
+          <button class="btn-export btn-export-pdf" onclick="exportJobToPDF()">📄 Export PDF</button>
+        </div>
+      </div>
+
+      <div class="job-table-wrapper">
+        <table class="job-table">
+          <thead>
+            <tr>
+              <th class="col-no">No</th>
+              <th class="col-photo">Bukti Foto</th>
+              <th>Jenis Pekerjaan</th>
+              <th class="col-date">Tanggal</th>
+              <th class="col-time">Jam Mulai</th>
+              <th class="col-time">Jam Akhir</th>
+              <th>Keterangan</th>
+              <th class="col-action">Aksi</th>
+            </tr>
+          </thead>
+          <tbody id="jobCardListContainer"></tbody>
+        </table>
+      </div>
+
+      <div id="emptyJobDetailMsg" class="empty-msg" style="display: none;">
+        Tidak ada data pekerjaan yang sesuai dengan filter.
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 3: Folder Kerja Pribadi -->
+  <div id="personal-job-list-page" class="tab-content">
+    <div id="folderPersonalJobView">
+      <h2>Folder Kerja Pribadi</h2>
+      <div id="folderPersonalJobGrid" class="folder-grid"></div>
+      <div id="emptyFolderPersonalJobMsg" class="empty-msg" style="display:none;">
+        <div>Belum ada folder/data pekerjaan pribadi.</div>
+        <button class="btn-folder-job" style="margin-top:18px;padding:12px 22px;font-size:14px;" onclick="openPersonalJobInputModal('')">➕ Input Data Pekerjaan Pribadi</button>
+      </div>
+    </div>
+    <div id="detailPersonalJobView" style="display:none;">
+      <div class="controls-panel">
+        <button class="btn-back" onclick="closePersonalJobDetail()">⬅️ Kembali ke Folder</button>
+        <div class="folder-header-title" id="selectedPersonalJobFolderName">Folder: -</div>
+        <div class="folder-input-buttons" style="margin:12px 0 16px;">
+          <button class="btn-folder-job" style="padding:12px;font-size:14px;" onclick="openPersonalJobInputModal(activePersonalJobFolderNama)">➕ Input Data Pekerjaan</button>
+        </div>
+        <div class="filter-row">
+          <span class="filter-label">📅 Tanggal:</span>
+          <select id="personalJobSortOrder" class="filter-select" onchange="renderPersonalJobTable()">
+            <option value="DESC">Terbaru → Terlama</option>
+            <option value="ASC">Terlama → Terbaru</option>
+          </select>
+        </div>
+        <div class="export-buttons">
+          <button class="btn-export btn-export-excel" onclick="exportPersonalJobToExcel()">📊 Export Excel</button>
+          <button class="btn-export btn-export-pdf" onclick="exportPersonalJobToPDF()">📄 Export PDF</button>
+        </div>
+      </div>
+      <div class="job-table-wrapper">
+        <table class="job-table">
+          <thead><tr><th class="col-no">No</th><th class="col-photo">Bukti Foto</th><th>Nama Pekerjaan</th><th class="col-date">Tanggal</th><th class="col-time">Jam Mulai</th><th class="col-time">Jam Akhir</th><th>Keterangan</th><th class="col-action">Aksi</th></tr></thead>
+          <tbody id="personalJobTableBody"></tbody>
+        </table>
+      </div>
+      <div id="emptyPersonalJobDetailMsg" class="empty-msg" style="display:none;">Tidak ada data pekerjaan pribadi.</div>
+    </div>
+  </div>
+
+  <!-- TAB 4: Folder Pengeluaran (GRID TABLE VIEW) -->
+  <div id="expense-list-page" class="tab-content">
+    <div id="folderExpView">
+      <h2>Folder Pengeluaran (Per Jenis Pekerjaan)</h2>
+      <div id="folderExpGrid" class="folder-grid"></div>
+      <div id="emptyFolderExpMsg" class="empty-msg" style="display: none;">
+        Belum ada folder/catatan pengeluaran.
+      </div>
+    </div>
+
+    <div id="detailExpView" style="display: none;">
+      <div class="controls-panel">
+        <button class="btn-back" onclick="closeExpenseDetail()">⬅️ Kembali ke Folder</button>
+        <div class="folder-header-title" id="selectedExpFolderName">Folder: -</div>
+        <div class="folder-input-buttons" style="margin: 12px 0 16px;">
+          <button class="btn-folder-expense" style="padding: 12px; font-size: 14px;" onclick="openExpenseInputModal(activeExpFolderJenis)">➕ Input Data Pengeluaran</button>
+        </div>
+        
+        <div class="filter-row">
+          <span class="filter-label">💳 Filter:</span>
+          <select id="expNamaFilter" class="filter-select" onchange="renderExpenseDetailTable()">
+            <option value="ALL">Semua Nama Pengeluaran</option>
+          </select>
+        </div>
+
+        <div class="filter-row">
+          <span class="filter-label">📅 Tanggal:</span>
+          <select id="expSortOrder" class="filter-select" onchange="renderExpenseDetailTable()">
+            <option value="DESC">Terbaru → Terlama</option>
+            <option value="ASC">Terlama → Terbaru</option>
+          </select>
+        </div>
+
+        <div class="export-buttons">
+          <button class="btn-export btn-export-excel" onclick="exportExpenseToExcel()">📊 Export Excel</button>
+          <button class="btn-export btn-export-pdf" onclick="exportExpenseToPDF()">📄 Export PDF</button>
+        </div>
+      </div>
+
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>No</th>
+              <th>Bukti Foto</th>
+              <th>Nama Pengeluaran</th>
+              <th>Tanggal</th>
+              <th>Jumlah (Rp)</th>
+              <th>Keterangan</th>
+              <th>Aksi</th>
+            </tr>
+          </thead>
+          <tbody id="expenseTableBody"></tbody>
+        </table>
+      </div>
+
+      <div class="summary-grid">
+        <div class="summary-box">
+          <span class="summary-title">TOTAL MODAL</span>
+          <span id="totalCapitalAmount" class="summary-value text-success">Rp 0</span>
+        </div>
+        <div class="summary-box">
+          <span class="summary-title">TOTAL TERPAKAI</span>
+          <span id="totalExpAmount" class="summary-value text-danger">Rp 0</span>
+        </div>
+        <div class="summary-box">
+          <span class="summary-title">SISA MODAL</span>
+          <span id="remainingCapitalAmount" class="summary-value text-primary">Rp 0</span>
+        </div>
+      </div>
+
+      <div id="emptyExpDetailMsg" class="empty-msg" style="display: none;">
+        Tidak ada data pengeluaran yang sesuai dengan filter.
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Modal Input Pekerjaan --><div id="jobInputModal" class="modal" onclick="if(event.target===this)closeJobInputModal()"><div class="form-modal-box"><div class="form-modal-header"><h3 id="jobFormTitle">Catat Pekerjaan Baru</h3><button type="button" class="form-modal-close" onclick="closeJobInputModal()">×</button></div><form id="jobForm"><input type="hidden" id="editJobId"><div class="form-group"><label for="namaPekerja">Nama Personel / Pengerja</label><input type="text" id="namaPekerja" required readonly style="background-color:#f1f5f9;cursor:not-allowed;"></div><div class="form-group"><label for="jenisPekerjaan">Jenis Pekerjaan</label><input type="text" id="jenisPekerjaan" required placeholder="Ketik jenis pekerjaan..."></div><div class="form-group"><label for="tanggalPekerjaan">Tanggal Pekerjaan</label><input type="date" id="tanggalPekerjaan" required></div><div class="form-group"><label for="jamMulai">Jam Mulai <span style="font-weight:400;color:#94a3b8;">(opsional)</span></label><input type="time" id="jamMulai"></div><div class="form-group"><label for="jamAkhir">Jam Akhir <span style="font-weight:400;color:#94a3b8;">(opsional)</span></label><input type="time" id="jamAkhir"></div><div class="form-group"><label for="dokumentasiPekerjaan">Dokumentasi (Foto)</label><input type="file" id="dokumentasiPekerjaan" accept="image/*" onchange="previewFileImage(event,'previewJobImg','jobPreviewContainer','jobBase64')"><input type="hidden" id="jobBase64"><div class="img-preview-container" id="jobPreviewContainer"><img id="previewJobImg" class="img-preview" alt="Preview Foto"></div></div><div class="form-group"><label for="keteranganPekerjaan">Keterangan Pekerjaan</label><textarea id="keteranganPekerjaan" placeholder="Tuliskan rincian atau detail pekerjaan..."></textarea></div><button type="submit" id="btnSubmitJob" class="btn-submit">Simpan Pekerjaan</button><button type="button" id="btnCancelJob" class="btn-submit btn-cancel" style="display:none" onclick="resetJobForm();closeJobInputModal()">Batal Edit</button></form></div></div>
+<!-- Modal Input Pekerjaan Pribadi -->
+<div id="personalJobInputModal" class="modal" onclick="if(event.target===this)closePersonalJobInputModal()">
+  <div class="form-modal-box">
+    <div class="form-modal-header"><h3 id="personalJobFormTitle">Catat Pekerjaan Pribadi Baru</h3><button type="button" class="form-modal-close" onclick="closePersonalJobInputModal()">×</button></div>
+    <form id="personalJobForm">
+      <input type="hidden" id="editPersonalJobId">
+      <div class="form-group"><label for="personalJenisPekerjaan">Nama / Jenis Pekerjaan</label><input type="text" id="personalJenisPekerjaan" required placeholder="Contoh: Perbaikan Rumah / Servis AC"></div>
+      <div class="form-group"><label for="personalTanggalPekerjaan">Tanggal Pekerjaan</label><input type="date" id="personalTanggalPekerjaan" required></div>
+      <div class="form-group"><label for="personalJamMulai">Jam Mulai <span style="font-weight:400;color:#94a3b8;">(opsional)</span></label><input type="time" id="personalJamMulai"></div>
+      <div class="form-group"><label for="personalJamAkhir">Jam Akhir <span style="font-weight:400;color:#94a3b8;">(opsional)</span></label><input type="time" id="personalJamAkhir"></div>
+      <div class="form-group"><label for="personalDokumentasi">Dokumentasi (Foto)</label><input type="file" id="personalDokumentasi" accept="image/*" onchange="previewFileImage(event,'previewPersonalJobImg','personalJobPreviewContainer','personalJobBase64')"><input type="hidden" id="personalJobBase64"><div class="img-preview-container" id="personalJobPreviewContainer"><img id="previewPersonalJobImg" class="img-preview" alt="Preview Foto"></div></div>
+      <div class="form-group"><label for="personalKeterangan">Keterangan Pekerjaan</label><textarea id="personalKeterangan" placeholder="Tuliskan rincian atau detail pekerjaan..."></textarea></div>
+      <button type="submit" id="btnSubmitPersonalJob" class="btn-submit">Simpan Pekerjaan</button>
+      <button type="button" id="btnCancelPersonalJob" class="btn-submit btn-cancel" style="display:none" onclick="resetPersonalJobForm();closePersonalJobInputModal()">Batal Edit</button>
+    </form>
+  </div>
+</div>
+
+<!-- Modal Input Pengeluaran --><div id="expenseInputModal" class="modal" onclick="if(event.target===this)closeExpenseInputModal()"><div class="form-modal-box"><div class="form-modal-header"><h3 id="expFormTitle">Catat Pengeluaran Baru / Input Modal</h3><button type="button" class="form-modal-close" onclick="closeExpenseInputModal()">×</button></div><form id="expenseForm"><input type="hidden" id="editExpenseId"><div class="form-group" style="display:none"><label for="namaPengeluaranUser">Nama User</label><input type="text" id="namaPengeluaranUser" readonly></div><div class="form-group"><label for="expJenisPekerjaan">Jenis Pekerjaan</label><input type="text" id="expJenisPekerjaan" list="jenisDatalist" required placeholder="Contoh: Pemasangan Keramik / Proyek A" onchange="onExpJenisChange()"><datalist id="jenisDatalist"></datalist></div><div class="modal-input-card"><div class="form-group" style="margin-bottom:8px"><label style="color:#15803d;cursor:pointer"><input type="checkbox" id="chkInputCapital" onchange="toggleCapitalInput()" style="width:auto;margin-right:6px"> 💡 Atur / Perbarui Modal Utama untuk Jenis Pekerjaan ini</label></div><div id="capitalInputContainer" style="display:none;margin-top:10px"><label for="jumlahModal">Total Modal Pekerjaan (Rp)</label><input type="number" id="jumlahModal" min="0" placeholder="Contoh: 5000000"></div></div><div class="form-group"><label for="namaPengeluaran">Nama Pengeluaran</label><input type="text" id="namaPengeluaran" required placeholder="Contoh: Beli Semen 5 Sak / Uang Makan"></div><div class="form-group"><label for="tanggalPengeluaran">Tanggal Pengeluaran</label><input type="date" id="tanggalPengeluaran" required></div><div class="form-group"><label for="jumlahPengeluaran">Jumlah / Total Pengeluaran (Rp)</label><input type="number" id="jumlahPengeluaran" min="0" required placeholder="Contoh: 350000"></div><div class="form-group"><label for="buktiPengeluaran">Bukti Pengeluaran (Foto Nota/Struk)</label><input type="file" id="buktiPengeluaran" accept="image/*" onchange="previewFileImage(event,'previewExpImg','expPreviewContainer','expBase64')"><input type="hidden" id="expBase64"><div class="img-preview-container" id="expPreviewContainer"><img id="previewExpImg" class="img-preview" alt="Preview Bukti Foto"></div></div><div class="form-group"><label for="keteranganPengeluaran">Keterangan</label><textarea id="keteranganPengeluaran" placeholder="Tuliskan catatan tambahan mengenai pengeluaran..."></textarea></div><button type="submit" id="btnSubmitExp" class="btn-submit btn-expense">Simpan Transaksi</button><button type="button" id="btnCancelExp" class="btn-submit btn-cancel" style="display:none" onclick="resetExpenseForm();closeExpenseInputModal()">Batal Edit</button></form></div></div>
+
+<!-- Modal Rincian Data User (Admin View Only) -->
+<div id="userSummaryModal" class="modal">
+  <div class="confirm-modal-box" style="max-width: 700px; text-align: left; width: 95%;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+      <h3 style="font-size: 18px; color: var(--text);" id="modalUserSummaryName">Rincian Data User</h3>
+      <span style="cursor: pointer; font-size: 20px; font-weight: bold;" onclick="closeUserSummaryModal()">&times;</span>
+    </div>
+    <div id="modalUserSummaryContent" style="max-height: 70vh; overflow-y: auto;">
+      <!-- Data tabel rinci diisi via JS -->
+    </div>
+    <div style="margin-top: 20px; display:flex; gap:10px; flex-wrap:wrap;">
+      <button class="btn-export btn-export-excel" style="flex:1; min-width:140px;" onclick="exportSelectedUserToExcel()">📊 Download Excel</button>
+      <button class="btn-export btn-export-pdf" style="flex:1; min-width:140px;" onclick="exportSelectedUserToPDF()">📄 Download PDF</button>
+      <button class="btn-modal-cancel" style="flex:1; min-width:100px;" onclick="closeUserSummaryModal()">Tutup</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Photo Popup -->
+<div id="photoModal" class="modal" onclick="closeModal()">
+  <span class="modal-close" onclick="closeModal()">&times;</span>
+  <img id="modalImg" class="modal-content" src="" alt="Foto Full Size">
+</div>
+
+<!-- Modal Konfirmasi Hapus Folder -->
+<div id="deleteFolderModal" class="modal">
+  <div class="confirm-modal-box">
+    <div class="confirm-modal-icon">⚠️</div>
+    <div class="confirm-modal-title" id="deleteFolderModalTitle">Hapus Folder</div>
+    <div class="confirm-modal-desc" id="deleteFolderModalDesc">Apakah Anda yakin ingin menghapus folder ini beserta seluruh isinya?</div>
+    <div class="warning-box">
+      DATA YANG DIHAPUS TIDAK BISA DIKEMBALIKAN LAGI
+    </div>
+    <div class="confirm-modal-actions">
+      <button class="btn-modal-cancel" onclick="closeDeleteFolderModal()">Batal</button>
+      <button class="btn-modal-confirm" id="btnConfirmDeleteFolder">Ya, Hapus Folder</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Status Folder -->
+<div id="folderStatusModal" class="modal" onclick="if(event.target===this)closeFolderStatusModal()">
+  <div class="confirm-modal-box" style="max-width:420px;">
+    <div class="confirm-modal-icon">📌</div>
+    <div class="confirm-modal-title" id="folderStatusModalTitle">Status Folder</div>
+    <div class="confirm-modal-desc">Pilih status folder ini. Status digunakan sebagai penanda apakah pekerjaan/pengeluaran sudah dilaporkan atau belum.</div>
+    <div style="display:flex;flex-direction:column;gap:10px;">
+      <button class="btn-modal-confirm" style="background:#64748b;" onclick="setSelectedFolderStatus('processed')">✅ Sudah Diproses</button>
+      <button class="btn-modal-confirm" style="background:#f59e0b;" onclick="setSelectedFolderStatus('pending')">⏳ Belum Diproses</button>
+      <button class="btn-modal-cancel" onclick="closeFolderStatusModal()">Batal</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  let jobsMap = {};      // userId -> array of jobs
+  let personalJobsMap = {}; // userId -> array of personal jobs
+  let expensesMap = {};  // userId -> array of expenses
+  let capitalsMap = {};  // userId -> { jenis: modalValue }
+  let jobFolderStatusMap = {};
+  let personalJobFolderStatusMap = {};
+  let expenseFolderStatusMap = {};
+  let users = [];
+  let currentUser = null;
+
+  let activeJobFolderNama = "";
+  let activeSummaryUser = null;
+  let activeExpFolderJenis = "";
+  let activePersonalJobFolderNama = "";
+  let selectedFolderStatusTarget = { type: null, identifier: null };
+  let currentTabId = "dashboard-page";
+  let navigationRestored = false;
+
+  const NAV_STATE_KEY = "kerjaKu_navigation_state";
+
+  let folderToDelete = { type: null, identifier: null };
+
+  function saveNavigationState() {
+    try {
+      sessionStorage.setItem(NAV_STATE_KEY, JSON.stringify({
+        tabId: currentTabId,
+        jobFolder: activeJobFolderNama || "",
+        personalJobFolder: activePersonalJobFolderNama || "",
+        expenseFolder: activeExpFolderJenis || ""
+      }));
+    } catch (e) {}
+  }
+
+  function clearMenuDetailState() {
+    activeJobFolderNama = "";
+    activePersonalJobFolderNama = "";
+    activeExpFolderJenis = "";
+  }
+
+  function getSavedNavigationState() {
+    try {
+      const raw = sessionStorage.getItem(NAV_STATE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function restoreNavigationState() {
+    if (navigationRestored || !currentUser) return;
+    navigationRestored = true;
+
+    const saved = getSavedNavigationState();
+    if (!saved || !saved.tabId) {
+      switchTab('dashboard-page', { restoring: true });
+      return;
+    }
+
+    if (saved.tabId === 'job-list-page' && saved.jobFolder) {
+      activeJobFolderNama = saved.jobFolder;
+    } else if (saved.tabId === 'personal-job-list-page' && saved.personalJobFolder) {
+      activePersonalJobFolderNama = saved.personalJobFolder;
+    } else if (saved.tabId === 'expense-list-page' && saved.expenseFolder) {
+      activeExpFolderJenis = saved.expenseFolder;
+    }
+
+    switchTab(saved.tabId, { restoring: true });
+  }
+
+  function refreshCurrentView() {
+    if (!currentUser) return;
+
+    if (currentTabId === 'dashboard-page') {
+      renderDashboard();
+    } else if (currentTabId === 'job-list-page') {
+      if (activeJobFolderNama) {
+        openJobFolderDetail(activeJobFolderNama);
+      } else {
+        showJobFolderList();
+      }
+    } else if (currentTabId === 'personal-job-list-page') {
+      if (activePersonalJobFolderNama) openPersonalJobFolderDetail(activePersonalJobFolderNama);
+      else showPersonalJobFolderList();
+    } else if (currentTabId === 'expense-list-page') {
+      if (activeExpFolderJenis) {
+        openExpenseFolderDetail(activeExpFolderJenis);
+      } else {
+        showExpenseFolderList();
+      }
+    }
+  }
+
+  /* --- MANAJEMEN LOGIN & PERANGKAT --- */
+  // Gunakan mekanisme login yang sama dengan versi sebelum perubahan dashboard.
+  // Sesi hanya dihapus ketika user menekan Logout.
+  function checkSavedSession() {
+    const savedUser = localStorage.getItem('kerjaKu_user');
+    if (!savedUser) return;
+
+    // Jangan hapus sesi hanya karena ada error pada tampilan/dashboard.
+    // Sesi hanya dihapus oleh fungsi logout().
+    let parsed;
+    try {
+      parsed = JSON.parse(savedUser);
+    } catch (e) {
+      console.error('Data sesi lokal tidak valid:', e);
+      return;
+    }
+
+    const latestData = users.find(u => u.id === parsed.id);
+    currentUser = latestData || parsed;
+
+    try {
+      localStorage.setItem('kerjaKu_user', JSON.stringify(currentUser));
+    } catch (e) {
+      console.warn('Gagal memperbarui data sesi lokal:', e);
+    }
+
+    const loginScreen = document.getElementById('loginScreen');
+    if (loginScreen) loginScreen.style.display = 'none';
+
+    try {
+      updateProfileUI();
+    } catch (e) {
+      // Error UI tidak boleh membuat user logout.
+      console.error('Gagal memperbarui tampilan profil:', e);
+    }
+  }
+
+  function updateProfileUI() {
+    if (currentUser) {
+      document.getElementById('userNameProfile').textContent = currentUser.nama || 'User';
+      document.getElementById('userRoleProfile').textContent = currentUser.role || 'Teknisi / Lapangan';
+      document.getElementById('userAvatar').textContent = (currentUser.nama || 'K').charAt(0).toUpperCase();
+
+      const adminSection = document.getElementById('adminUserSection');
+      const adminDetailsSection = document.getElementById('adminUserDetailsSection');
+      const statusGrid = document.getElementById('dashboardStatusGrid');
+      const personalPendingSection = document.getElementById('personalPendingSection');
+      // adminMetricsGrid sudah tidak dipakai pada Dashboard baru.
+      // Jangan menganggap elemen dashboard lama selalu ada.
+      const adminMetrics = document.getElementById('adminMetricsGrid');
+      const userMenuItems = document.querySelectorAll('.user-menu-item');
+      const dashboardHeading = document.getElementById('dashboardHeading');
+
+      if (currentUser.role === 'Administrator') {
+        if (adminSection) adminSection.style.display = 'block';
+        if (adminDetailsSection) adminDetailsSection.style.display = 'block';
+        if (statusGrid) statusGrid.style.display = 'none';
+        if (personalPendingSection) personalPendingSection.style.display = 'none';
+        if (adminMetrics) adminMetrics.style.display = 'grid';
+        if (dashboardHeading) dashboardHeading.textContent = 'Dashboard Admin';
+        userMenuItems.forEach(item => item.style.display = 'none');
+      } else {
+        if (adminSection) adminSection.style.display = 'none';
+        if (adminDetailsSection) adminDetailsSection.style.display = 'none';
+        if (statusGrid) statusGrid.style.display = 'grid';
+        if (personalPendingSection) personalPendingSection.style.display = 'block';
+        if (adminMetrics) adminMetrics.style.display = 'none';
+        if (dashboardHeading) dashboardHeading.textContent = 'Ringkasan Aplikasi Anda';
+        userMenuItems.forEach(item => item.style.display = 'flex');
+      }
+
+      const namaPekerjaEl = document.getElementById('namaPekerja');
+      const namaPengeluaranUserEl = document.getElementById('namaPengeluaranUser');
+      if (namaPekerjaEl) namaPekerjaEl.value = currentUser.nama || '';
+      if (namaPengeluaranUserEl) namaPengeluaranUserEl.value = currentUser.nama || '';
+    }
+  }
+
+  document.getElementById('loginForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    const userId = document.getElementById('loginUserSelect').value;
+    const passInput = document.getElementById('loginPassword').value;
+    const errorEl = document.getElementById('loginErrorMsg');
+
+    const targetUser = users.find(u => u.id === userId);
+
+    if (targetUser && targetUser.password === passInput) {
+      currentUser = targetUser;
+      localStorage.setItem('kerjaKu_user', JSON.stringify(targetUser));
+      errorEl.style.display = 'none';
+      document.getElementById('loginScreen').style.display = 'none';
+      document.getElementById('loginPassword').value = '';
+      updateProfileUI();
+      switchTab('dashboard-page');
+    } else {
+      errorEl.style.display = 'block';
+    }
+  });
+
+  function logout() {
+    if (confirm('Apakah Anda yakin ingin keluar dari perangkat ini?')) {
+      localStorage.removeItem('kerjaKu_user');
+      currentUser = null;
+      document.getElementById('loginScreen').style.display = 'flex';
+    }
+  }
+
+  /* --- MODAL REGISTRASI USER & KONTROL HAK AKSES ADMIN --- */
+  async function openRegisterModal() {
+    document.getElementById('loginScreen').style.display = 'none';
+    document.getElementById('registerScreen').style.display = 'flex';
+
+    try {
+      const snapshot = await dbGet(dbRef(db, 'users'));
+      const existingUsers = snapshot.val();
+      const roleSelect = document.getElementById('regUserRole');
+      const adminOpt = document.getElementById('adminRoleOption');
+      const firstNotice = document.getElementById('firstUserNotice');
+      const subNotice = document.getElementById('subsequentUserNotice');
+
+      if (!existingUsers || Object.keys(existingUsers).length === 0) {
+        adminOpt.disabled = false;
+        roleSelect.value = 'Administrator';
+        roleSelect.disabled = true;
+        firstNotice.style.display = 'block';
+        subNotice.style.display = 'none';
+      } else {
+        adminOpt.disabled = true;
+        roleSelect.value = 'Teknisi / Lapangan';
+        roleSelect.disabled = false;
+        firstNotice.style.display = 'none';
+        subNotice.style.display = 'block';
+      }
+    } catch (error) {
+      console.error("Gagal memeriksa data user:", error);
+    }
+  }
+
+  function closeRegisterModal() {
+    document.getElementById('registerScreen').style.display = 'none';
+    document.getElementById('registerForm').reset();
+    document.getElementById('loginScreen').style.display = 'flex';
+  }
+
+  async function handleRegister(e) {
+    e.preventDefault();
+
+    const nama = document.getElementById('regUserName').value.trim();
+    const password = document.getElementById('regUserPassword').value.trim();
+
+    if (!nama || !password) {
+      alert("Harap isi semua kolom!");
+      return;
+    }
+
+    try {
+      const snapshot = await dbGet(dbRef(db, 'users'));
+      const existingUsers = snapshot.val() || {};
+
+      const isExist = Object.values(existingUsers).some(u => u.nama && u.nama.toLowerCase() === nama.toLowerCase());
+      if (isExist) {
+        alert("Nama user sudah terdaftar! Gunakan nama lain.");
+        return;
+      }
+
+      let role = 'Teknisi / Lapangan';
+      if (Object.keys(existingUsers).length === 0) {
+        role = 'Administrator';
+      } else {
+        const selectedRole = document.getElementById('regUserRole').value;
+        if (selectedRole !== 'Administrator') {
+          role = selectedRole;
+        }
+      }
+
+      const newUserRef = dbPush(dbRef(db, 'users'));
+      await dbSet(newUserRef, {
+        nama: nama,
+        password: password,
+        role: role,
+        createdAt: new Date().toISOString()
+      });
+
+      alert(`Registrasi berhasil! Akun '${nama}' dibuat sebagai '${role}'. Silakan login.`);
+      closeRegisterModal();
+    } catch (error) {
+      console.error("Gagal mendaftarkan user:", error);
+      alert("Terjadi kesalahan saat pendaftaran. Coba lagi.");
+    }
+  }
+
+  /* --- MANAJEMEN DASHBOARD ADMIN (DAFTAR USER TERDAFTAR) --- */
+  function renderUserTableAndLoginSelect() {
+    const tbody = document.getElementById('userTableBody');
+    const loginSelect = document.getElementById('loginUserSelect');
+    
+    if (tbody) tbody.innerHTML = '';
+    if (loginSelect) loginSelect.innerHTML = '';
+
+    if (users.length === 0) {
+      if (tbody) tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#64748b;">Belum ada user terdaftar. Silakan buat akun pertama.</td></tr>';
+      if (loginSelect) loginSelect.innerHTML = '<option value="">Tidak ada user terdaftar</option>';
+      return;
+    }
+
+    const firstAdminId = users[0] ? users[0].id : null;
+
+    users.forEach((u, index) => {
+      if (tbody) {
+        const tr = document.createElement('tr');
+        tr.className = "user-table-row";
+        
+        const regDate = u.createdAt ? new Date(u.createdAt).toLocaleDateString('id-ID') : '-';
+        const isFirstAdmin = (u.id === firstAdminId);
+
+        let accessToggleHtml = '';
+        if (isFirstAdmin) {
+          accessToggleHtml = `<span style="font-size:11px; color:#166534; font-weight:700;">👑 Admin Utama</span>`;
+        } else {
+          const isAdmin = u.role === 'Administrator';
+          accessToggleHtml = `
+            <button onclick="event.stopPropagation(); toggleAdminRole('${u.id}', ${!isAdmin})" 
+                    style="padding: 4px 8px; font-size:11px; border-radius:4px; border:none; cursor:pointer; font-weight:600; 
+                    background: ${isAdmin ? '#fee2e2' : '#dcfce7'}; color: ${isAdmin ? '#991b1b' : '#166534'};">
+              ${isAdmin ? 'Revoke Admin' : 'Jadikan Admin'}
+            </button>
+          `;
+        }
+
+        let deleteBtnHtml = '';
+        if (isFirstAdmin) {
+          deleteBtnHtml = `<span style="font-size:12px; color:#94a3b8;">Terunci</span>`;
+        } else {
+          deleteBtnHtml = `<button class="btn-delete" onclick="event.stopPropagation(); deleteUser('${u.id}')">🗑️ Hapus</button>`;
+        }
+
+        tr.innerHTML = `
+          <td>${index + 1}</td>
+          <td><strong>${u.nama || '-'}</strong></td>
+          <td><span class="capital-badge">${u.role || 'Teknisi / Lapangan'}</span></td>
+          <td>${regDate}</td>
+          <td>${accessToggleHtml}</td>
+          <td>${deleteBtnHtml}</td>
+        `;
+
+        tr.addEventListener('click', () => {
+          openUserSummaryModal(u);
+        });
+
+        tbody.appendChild(tr);
+      }
+
+      if (loginSelect) {
+        const opt = document.createElement('option');
+        opt.value = u.id;
+        opt.textContent = `${u.nama} (${u.role || 'User'})`;
+        loginSelect.appendChild(opt);
+      }
+    });
+  }
+
+  function toggleAdminRole(userId, makeAdmin) {
+    const targetRole = makeAdmin ? 'Administrator' : 'Teknisi / Lapangan';
+    if (confirm(`Apakah Anda yakin ingin mengubah akses user ini menjadi ${targetRole}?`)) {
+      dbUpdate(dbRef(db, `users/${userId}`), { role: targetRole });
+    }
+  }
+
+  function openUserSummaryModal(userObj) {
+    if (!currentUser || currentUser.role !== 'Administrator') return;
+
+    activeSummaryUser = userObj;
+    document.getElementById('modalUserSummaryName').textContent = `Tabel Rinci Data User: ${userObj.nama}`;
+    
+    const userJobs = jobsMap[userObj.id] || [];
+    const userExpenses = expensesMap[userObj.id] || [];
+    const userCapitals = capitalsMap[userObj.id] || {};
+
+    let totalExpValue = 0;
+    userExpenses.forEach(e => totalExpValue += (e.jumlah || 0));
+
+    let totalCapValue = 0;
+    Object.values(userCapitals).forEach(c => totalCapValue += (c || 0));
+
+    let html = `
+      <div style="font-size: 14px; display: flex; flex-direction: column; gap: 16px;">
+        <div style="background: #f8fafc; padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
+          <strong>Informasi Akun:</strong>
+          <div style="display: flex; justify-content: space-between; margin-top: 6px;">
+            <span>Peran: <span class="capital-badge">${userObj.role || 'Teknisi'}</span></span>
+            <span>Terdaftar: ${userObj.createdAt ? new Date(userObj.createdAt).toLocaleDateString('id-ID') : '-'}</span>
+          </div>
+        </div>
+
+        <div>
+          <h4 style="margin-bottom: 8px; color: var(--primary);">📝 Catatan Pekerjaan (${userJobs.length})</h4>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>No</th>
+                  <th>Jenis Pekerjaan</th>
+                  <th>Tanggal</th>
+                  <th>Jam Mulai</th>
+                  <th>Jam Akhir</th>
+                  <th>Keterangan</th>
+                </tr>
+              </thead>
+              <tbody>
+    `;
+
+    if (userJobs.length === 0) {
+      html += `<tr><td colspan="6" style="text-align:center; color:#64748b;">Belum ada data pekerjaan.</td></tr>`;
+    } else {
+      userJobs.forEach((j, idx) => {
+        html += `
+          <tr>
+            <td>${idx + 1}</td>
+            <td><strong>${j.jenis || '-'}</strong></td>
+            <td>${j.tanggal || '-'}</td>
+            <td>${j.jamMulai || '-'}</td>
+            <td>${j.jamAkhir || '-'}</td>
+            <td>${j.keterangan || '-'}</td>
+          </tr>
+        `;
+      });
+    }
+
+    html += `
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div>
+          <h4 style="margin-bottom: 8px; color: var(--danger);">💸 Catatan Pengeluaran & Modal (${userExpenses.length} Transaksi)</h4>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>No</th>
+                  <th>Jenis Pekerjaan</th>
+                  <th>Nama Pengeluaran</th>
+                  <th>Tanggal</th>
+                  <th>Jumlah (Rp)</th>
+                  <th>Keterangan</th>
+                </tr>
+              </thead>
+              <tbody>
+    `;
+
+    if (userExpenses.length === 0) {
+      html += `<tr><td colspan="6" style="text-align:center; color:#64748b;">Belum ada data pengeluaran.</td></tr>`;
+    } else {
+      userExpenses.forEach((e, idx) => {
+        html += `
+          <tr>
+            <td>${idx + 1}</td>
+            <td>${e.jenis || '-'}</td>
+            <td><strong>${e.nama || '-'}</strong></td>
+            <td>${e.tanggal || '-'}</td>
+            <td class="amount-text">${formatRupiah(e.jumlah || 0)}</td>
+            <td>${e.keterangan || '-'}</td>
+          </tr>
+        `;
+      });
+    }
+
+    html += `
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="summary-grid">
+          <div class="summary-box">
+            <span class="summary-title">TOTAL MODAL DIATUR</span>
+            <span class="summary-value text-success">${formatRupiah(totalCapValue)}</span>
+          </div>
+          <div class="summary-box">
+            <span class="summary-title">TOTAL PENGELUARAN</span>
+            <span class="summary-value text-danger">${formatRupiah(totalExpValue)}</span>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('modalUserSummaryContent').innerHTML = html;
+    document.getElementById('userSummaryModal').style.display = 'flex';
+  }
+
+  function getSelectedUserExportData() {
+    if (!activeSummaryUser) return null;
+    const userId = activeSummaryUser.id;
+    return {
+      user: activeSummaryUser,
+      jobs: jobsMap[userId] || [],
+      expenses: expensesMap[userId] || [],
+      capitals: capitalsMap[userId] || {}
+    };
+  }
+
+  function exportSelectedUserToExcel() {
+    const data = getSelectedUserExportData();
+    if (!data) return;
+
+    const wb = XLSX.utils.book_new();
+    const jobRows = data.jobs.map((j, i) => ({
+      "No": i + 1,
+      "Nama Personel": j.nama || data.user.nama || "-",
+      "Jenis Pekerjaan": j.jenis || "-",
+      "Tanggal": j.tanggal || "-",
+      "Jam Mulai": j.jamMulai || "-",
+      "Jam Akhir": j.jamAkhir || "-",
+      "Keterangan": j.keterangan || "-"
+    }));
+    const expRows = data.expenses.map((e, i) => ({
+      "No": i + 1,
+      "Jenis Pekerjaan": e.jenis || "-",
+      "Nama Pengeluaran": e.nama || "-",
+      "Tanggal": e.tanggal || "-",
+      "Jumlah (Rp)": e.jumlah || 0,
+      "Keterangan": e.keterangan || "-"
+    }));
+    const capitalRows = Object.entries(data.capitals).map(([jenis, nilai], i) => ({
+      "No": i + 1,
+      "Jenis Pekerjaan": jenis,
+      "Modal (Rp)": nilai || 0
+    }));
+
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(jobRows.length ? jobRows : [{"Keterangan":"Belum ada data pekerjaan"}]), "Pekerjaan");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(expRows.length ? expRows : [{"Keterangan":"Belum ada data pengeluaran"}]), "Pengeluaran");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(capitalRows.length ? capitalRows : [{"Keterangan":"Belum ada data modal"}]), "Modal");
+    XLSX.writeFile(wb, `Data_User_${data.user.nama || 'User'}.xlsx`);
+  }
+
+  function exportSelectedUserToPDF() {
+    const data = getSelectedUserExportData();
+    if (!data) return;
+
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ orientation: 'landscape' });
+    const userName = data.user.nama || 'User';
+    doc.setFontSize(16);
+    doc.text(`Data User: ${userName}`, 14, 14);
+    doc.setFontSize(10);
+    doc.text(`Role: ${data.user.role || '-'} | Terdaftar: ${data.user.createdAt ? new Date(data.user.createdAt).toLocaleDateString('id-ID') : '-'}`, 14, 21);
+
+    let y = 27;
+    doc.setFontSize(12);
+    doc.text(`Catatan Pekerjaan (${data.jobs.length})`, 14, y);
+    doc.autoTable({
+      head: [["No", "Nama Personel", "Jenis Pekerjaan", "Tanggal", "Jam Mulai", "Jam Akhir", "Keterangan"]],
+      body: data.jobs.map((j,i) => [i+1, j.nama || userName, j.jenis || '-', j.tanggal || '-', j.jamMulai || '-', j.jamAkhir || '-', j.keterangan || '-']),
+      startY: y + 3,
+      styles: { fontSize: 7 }
+    });
+
+    y = (doc.lastAutoTable && doc.lastAutoTable.finalY ? doc.lastAutoTable.finalY : y + 20) + 10;
+    doc.setFontSize(12);
+    doc.text(`Catatan Pengeluaran (${data.expenses.length})`, 14, y);
+    doc.autoTable({
+      head: [["No", "Jenis Pekerjaan", "Nama Pengeluaran", "Tanggal", "Jumlah (Rp)", "Keterangan"]],
+      body: data.expenses.map((e,i) => [i+1, e.jenis || '-', e.nama || '-', e.tanggal || '-', formatRupiah(e.jumlah || 0), e.keterangan || '-']),
+      startY: y + 3,
+      styles: { fontSize: 7 }
+    });
+
+    doc.save(`Data_User_${userName}.pdf`);
+  }
+
+  function closeUserSummaryModal() {
+    document.getElementById('userSummaryModal').style.display = 'none';
+  }
+
+  function deleteUser(id) {
+    if (confirm('Apakah Anda yakin ingin menghapus user ini beserta seluruh data pekerjaan dan pengeluarannya?')) {
+      dbRemove(dbRef(db, `users/${id}`));
+      dbRemove(dbRef(db, `jobs/${id}`));
+      dbRemove(dbRef(db, `personalJobs/${id}`));
+      dbRemove(dbRef(db, `expenses/${id}`));
+      dbRemove(dbRef(db, `capitals/${id}`));
+      dbRemove(dbRef(db, `folderStatuses/${id}`));
+    }
+  }
+
+  /* --- NAVIGASI & APP UTAMA --- */
+  function toggleSidebar() {
+    document.getElementById('sidebar').classList.toggle('active');
+    document.getElementById('sidebarOverlay').classList.toggle('active');
+  }
+
+  function switchTab(tabId, options = {}) {
+    if (currentUser && currentUser.role === 'Administrator' && tabId !== 'dashboard-page' && tabId !== 'user-page') {
+      alert("Admin hanya memiliki akses ke Dashboard Utama dan Profil User.");
+      return;
+    }
+
+    const previousTabId = currentTabId;
+    const isRestoring = !!options.restoring;
+    const isForceReset = !!options.forceReset;
+
+    // Saat PINDAH MENU, halaman menu yang ditinggalkan di-reset ke halaman awalnya.
+    // Saat REFRESH, options.restoring=true sehingga folder/detail yang sedang dibuka dipertahankan.
+    if (!isRestoring && !isForceReset && previousTabId !== tabId) {
+      if (previousTabId === 'job-list-page') activeJobFolderNama = '';
+      if (previousTabId === 'personal-job-list-page') activePersonalJobFolderNama = '';
+      if (previousTabId === 'expense-list-page') activeExpFolderJenis = '';
+    }
+
+    currentTabId = tabId;
+
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.sidebar-item').forEach(el => {
+      el.classList.remove('active');
+      el.classList.remove('active-expense');
+    });
+
+    const target = document.getElementById(tabId);
+    if (!target) return;
+    target.classList.add('active');
+
+    const pageTitles = {
+      'dashboard-page': 'Dashboard Utama',
+      'job-list-page': 'Folder Kerja',
+      'personal-job-list-page': 'Folder Kerja Pribadi',
+      'expense-list-page': 'Folder Pengeluaran',
+      'user-page': 'Profil User'
+    };
+
+    document.getElementById('topPageTitle').textContent = pageTitles[tabId] || 'KerjaKu';
+
+    if (tabId === 'dashboard-page') {
+      document.getElementById('menuDashboard').classList.add('active');
+      renderDashboard();
+    } else if (tabId === 'job-list-page') {
+      document.getElementById('menuJobList').classList.add('active');
+      if (activeJobFolderNama) {
+        openJobFolderDetail(activeJobFolderNama);
+      } else {
+        showJobFolderList();
+      }
+    } else if (tabId === 'personal-job-list-page') {
+      document.getElementById('menuPersonalJobList').classList.add('active');
+      if (activePersonalJobFolderNama) openPersonalJobFolderDetail(activePersonalJobFolderNama);
+      else showPersonalJobFolderList();
+    } else if (tabId === 'expense-list-page') {
+      document.getElementById('menuExpList').classList.add('active-expense');
+      if (activeExpFolderJenis) {
+        openExpenseFolderDetail(activeExpFolderJenis);
+      } else {
+        showExpenseFolderList();
+      }
+    } else if (tabId === 'user-page') {
+      document.getElementById('menuUser').classList.add('active');
+    }
+
+    saveNavigationState();
+
+    const sidebar = document.getElementById('sidebar');
+    if (sidebar.classList.contains('active')) {
+      toggleSidebar();
+    }
+  }
+
+  function normalizeFolderIdentifier(value) {
+    return String(value || '').trim().toLowerCase();
+  }
+
+  function folderDbKey(identifier) {
+    return encodeURIComponent(String(identifier || '').trim()).replace(/\./g, '%2E');
+  }
+
+  function isFolderProcessed(type, identifier) {
+    const key = normalizeFolderIdentifier(identifier);
+    if (type === 'job') return jobFolderStatusMap[currentUser?.id]?.[key] === 'processed';
+    if (type === 'personal') return personalJobFolderStatusMap[currentUser?.id]?.[key] === 'processed';
+    if (type === 'expense') return expenseFolderStatusMap[currentUser?.id]?.[key] === 'processed';
+    return false;
+  }
+
+  function getFolderStatusLabel(type, identifier) {
+    return isFolderProcessed(type, identifier) ? 'Sudah Diproses' : 'Belum Diproses';
+  }
+
+  function openFolderStatusModal(type, identifier) {
+    if (!currentUser) return;
+    selectedFolderStatusTarget = { type, identifier };
+    const typeLabel = type === 'expense' ? 'Pengeluaran' : (type === 'personal' ? 'Kerja Pribadi' : 'Kerja');
+    document.getElementById('folderStatusModalTitle').textContent = `Status Folder ${typeLabel}: ${identifier}`;
+    document.getElementById('folderStatusModal').style.display = 'flex';
+  }
+
+  function closeFolderStatusModal() {
+    document.getElementById('folderStatusModal').style.display = 'none';
+    selectedFolderStatusTarget = { type: null, identifier: null };
+  }
+
+  function setSelectedFolderStatus(status) {
+    if (!currentUser || !selectedFolderStatusTarget.type || !selectedFolderStatusTarget.identifier) return;
+    const { type, identifier } = selectedFolderStatusTarget;
+    const pathType = type === 'expense' ? 'expense' : (type === 'personal' ? 'personal' : 'job');
+    dbSet(dbRef(db, `folderStatuses/${currentUser.id}/${pathType}/${folderDbKey(identifier)}`), status);
+    closeFolderStatusModal();
+    renderDashboard();
+    refreshCurrentView();
+  }
+
+  function countRecordsByFolderStatus(records, type) {
+    let processed = 0, pending = 0;
+    const groups = {};
+    (records || []).forEach(record => {
+      const folder = String(record.jenis || '').trim();
+      if (!folder) return;
+      const key = normalizeFolderIdentifier(folder);
+      if (!groups[key]) groups[key] = { name: folder, count: 0 };
+      groups[key].count++;
+    });
+    Object.keys(groups).forEach(key => {
+      if (isFolderProcessed(type, groups[key].name)) processed += groups[key].count;
+      else pending += groups[key].count;
+    });
+    return { processed, pending };
+  }
+
+  function renderPersonalPendingDashboard() {
+    const el = document.getElementById('personalPendingList');
+    const section = document.getElementById('personalPendingSection');
+    if (!el || !section) return;
+    if (!currentUser || currentUser.role === 'Administrator') { section.style.display = 'none'; return; }
+    section.style.display = 'block';
+    const records = personalJobsMap[currentUser.id] || [];
+    const groups = {};
+    records.forEach(job => {
+      const name = String(job.jenis || '').trim();
+      if (!name || isFolderProcessed('personal', name)) return;
+      const key = normalizeFolderIdentifier(name);
+      if (!groups[key]) groups[key] = { name, count: 0 };
+      groups[key].count++;
+    });
+    const pending = Object.values(groups).sort((a,b) => a.name.localeCompare(b.name, 'id'));
+    if (!pending.length) {
+      el.innerHTML = 'Tidak ada pekerjaan pribadi yang belum diproses.';
+      return;
+    }
+    el.innerHTML = `<ul class="personal-pending-list">${pending.map(item => `<li><span class="pending-job-name">${item.name}</span><span class="pending-job-count">${item.count} Data • Belum Diproses</span></li>`).join('')}</ul>`;
+  }
+
+  function renderAdminUserDetails() {
+    const section = document.getElementById('adminUserDetailsSection');
+    const list = document.getElementById('adminUserDetailsList');
+    if (!section || !list) return;
+
+    if (!currentUser || currentUser.role !== 'Administrator') {
+      section.style.display = 'none';
+      list.innerHTML = '';
+      return;
+    }
+
+    section.style.display = 'block';
+    if (!users.length) {
+      list.innerHTML = '<div style="color:var(--text-muted);">Belum ada user terdaftar.</div>';
+      return;
+    }
+
+    list.innerHTML = users.map((u, index) => {
+      const jobs = jobsMap[u.id] || [];
+      const expenses = expensesMap[u.id] || [];
+      const folders = {};
+      jobs.forEach(job => {
+        const name = String(job.jenis || '').trim();
+        if (!name) return;
+        const key = normalizeFolderIdentifier(name);
+        if (!folders[key]) folders[key] = name;
+      });
+      let jobProcessed = 0, jobPending = 0;
+      Object.values(folders).forEach(name => {
+        if (jobFolderStatusMap[u.id]?.[normalizeFolderIdentifier(name)] === 'processed') jobProcessed++;
+        else jobPending++;
+      });
+
+      const expFolders = {};
+      expenses.forEach(exp => {
+        const name = String(exp.jenis || '').trim();
+        if (!name) return;
+        const key = normalizeFolderIdentifier(name);
+        if (!expFolders[key]) expFolders[key] = {name, total:0};
+        expFolders[key].total += Number(exp.jumlah) || 0;
+      });
+      let expProcessed = 0, expPending = 0;
+      Object.values(expFolders).forEach(group => {
+        if (expenseFolderStatusMap[u.id]?.[normalizeFolderIdentifier(group.name)] === 'processed') expProcessed += group.total;
+        else expPending += group.total;
+      });
+
+      return `
+        <div style="border:1px solid var(--border); border-radius:12px; padding:14px; background:var(--card-bg); box-shadow:0 2px 8px rgba(0,0,0,.04);">
+          <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:12px;">
+            <div><div style="font-weight:700;font-size:15px;">${index+1}. ${u.nama || '-'}</div><div style="font-size:11px;color:var(--text-muted);">${u.role || 'Teknisi / Lapangan'}</div></div>
+            <button class="btn-submit" style="padding:6px 10px;font-size:11px;margin:0;" onclick="openUserSummaryModal(users.find(x => x.id === '${u.id}'))">Rincian</button>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <div style="padding:9px;border-radius:8px;background:#f0fdf4;"><div style="font-size:10px;color:#166534;">KERJA • SUDAH</div><strong>${jobProcessed} Folder</strong></div>
+            <div style="padding:9px;border-radius:8px;background:#fff7ed;"><div style="font-size:10px;color:#9a3412;">KERJA • BELUM</div><strong>${jobPending} Folder</strong></div>
+            <div style="padding:9px;border-radius:8px;background:#f0fdf4;"><div style="font-size:10px;color:#166534;">PENGELUARAN • SUDAH</div><strong>${formatRupiah(expProcessed)}</strong></div>
+            <div style="padding:9px;border-radius:8px;background:#fff7ed;"><div style="font-size:10px;color:#9a3412;">PENGELUARAN • BELUM</div><strong>${formatRupiah(expPending)}</strong></div>
+          </div>
+          <div style="margin-top:10px;font-size:11px;color:var(--text-muted);">Total folder kerja: ${jobProcessed + jobPending} • Total folder pengeluaran: ${Object.keys(expFolders).length}</div>
+        </div>`;
+    }).join('');
+  }
+
+  function renderDashboard() {
+    const allJobs = Object.values(jobsMap).flat();
+    const allExpenses = Object.values(expensesMap).flat();
+
+    // User biasa melihat datanya sendiri. Admin melihat seluruh user.
+    const scopeJobs = currentUser && currentUser.role !== 'Administrator'
+      ? (jobsMap[currentUser.id] || []) : allJobs;
+    const scopeExpenses = currentUser && currentUser.role !== 'Administrator'
+      ? (expensesMap[currentUser.id] || []) : allExpenses;
+
+    // PEKERJAAN: yang dihitung adalah JUMLAH FOLDER, bukan jumlah catatan di dalam folder.
+    let jobProcessed = 0, jobPending = 0;
+
+    function countJobFoldersForUser(uid) {
+      const groups = {};
+      (jobsMap[uid] || []).forEach(job => {
+        const folder = String(job.jenis || '').trim();
+        if (!folder) return;
+        const key = normalizeFolderIdentifier(folder);
+        if (!groups[key]) groups[key] = folder;
+      });
+      Object.values(groups).forEach(folder => {
+        if (jobFolderStatusMap[uid]?.[normalizeFolderIdentifier(folder)] === 'processed') jobProcessed++;
+        else jobPending++;
+      });
+    }
+
+    if (currentUser?.role === 'Administrator') {
+      Object.keys(jobsMap).forEach(uid => countJobFoldersForUser(uid));
+    } else if (currentUser) {
+      countJobFoldersForUser(currentUser.id);
+    }
+
+    // PENGELUARAN tetap dihitung berdasarkan total nominal rupiah per folder/status.
+    let expProcessed = 0, expPending = 0;
+    function countExpensesForUser(uid) {
+      const groups = {};
+      (expensesMap[uid] || []).forEach(exp => {
+        const folder = String(exp.jenis || '').trim();
+        if (!folder) return;
+        const key = normalizeFolderIdentifier(folder);
+        if (!groups[key]) groups[key] = { name: folder, total: 0 };
+        groups[key].total += Number(exp.jumlah) || 0;
+      });
+      Object.values(groups).forEach(group => {
+        if (expenseFolderStatusMap[uid]?.[normalizeFolderIdentifier(group.name)] === 'processed') expProcessed += group.total;
+        else expPending += group.total;
+      });
+    }
+
+    if (currentUser?.role === 'Administrator') {
+      Object.keys(expensesMap).forEach(uid => countExpensesForUser(uid));
+    } else if (currentUser) {
+      countExpensesForUser(currentUser.id);
+    }
+
+    document.getElementById('dashJobsProcessed').textContent = `${jobProcessed} Folder`;
+    document.getElementById('dashJobsPending').textContent = `${jobPending} Folder`;
+    document.getElementById('dashExpensesProcessed').textContent = formatRupiah(expProcessed);
+    document.getElementById('dashExpensesPending').textContent = formatRupiah(expPending);
+
+    if (currentUser?.role === 'Administrator') {
+      renderAdminUserDetails();
+      renderPersonalPendingDashboard(); // fungsi ini sendiri menyembunyikan section untuk admin
+    } else {
+      renderAdminUserDetails();
+      renderPersonalPendingDashboard();
+    }
+  }
+
+  function previewFileImage(event, imgTagId, containerId, hiddenInputId) {
+    const file = event.target.files[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const img = new Image();
+        img.src = e.target.result;
+        img.onload = function() {
+          const canvas = document.createElement('canvas');
+          const maxDim = 800;
+          let width = img.width;
+          let height = img.height;
+
+          if (width > height && width > maxDim) {
+            height *= maxDim / width;
+            width = maxDim;
+          } else if (height > maxDim) {
+            width *= maxDim / height;
+            height = maxDim;
+          }
+
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, width, height);
+
+          const base64Data = canvas.toDataURL('image/jpeg', 0.7);
+          document.getElementById(hiddenInputId).value = base64Data;
+          document.getElementById(imgTagId).src = base64Data;
+          document.getElementById(containerId).style.display = 'block';
+        };
+      };
+      reader.readAsDataURL(file);
+    }
+  }
+
+  function formatRupiah(number) {
+    return new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(number);
+  }
+
+  function openJobInputModal(folderJenis=''){if(!currentUser)return;resetJobForm();document.getElementById('namaPekerja').value=currentUser.nama||'';if(folderJenis)document.getElementById('jenisPekerjaan').value=folderJenis;document.getElementById('jobInputModal').style.display='flex';} function closeJobInputModal(){document.getElementById('jobInputModal').style.display='none';} function openExpenseInputModal(jenis=''){if(!currentUser)return;resetExpenseForm();populateJenisDatalist();if(jenis){document.getElementById('expJenisPekerjaan').value=jenis;onExpJenisChange();}document.getElementById('expenseInputModal').style.display='flex';} function closeExpenseInputModal(){document.getElementById('expenseInputModal').style.display='none';}
+
+  /* --- PEKERJAAN --- */
+  document.getElementById('jobForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    if (!currentUser) return;
+
+    const editId = document.getElementById('editJobId').value;
+    const existingJob = editId
+      ? (jobsMap[currentUser.id] || []).find(j => j.id == editId)
+      : null;
+
+    const jobData = {
+      nama: currentUser.nama,
+      jenis: document.getElementById('jenisPekerjaan').value.trim(),
+      tanggal: document.getElementById('tanggalPekerjaan').value,
+      jamMulai: document.getElementById('jamMulai').value || "",
+      jamAkhir: document.getElementById('jamAkhir').value || "",
+      keterangan: document.getElementById('keteranganPekerjaan').value.trim(),
+      dokumentasi: document.getElementById('jobBase64').value,
+      // Timestamp dibuat otomatis saat data pertama kali disimpan.
+      // Saat edit, timestamp lama dipertahankan agar urutan tidak berubah.
+      createdAt: existingJob && existingJob.createdAt ? existingJob.createdAt : Date.now()
+    };
+
+    if (editId) {
+      dbUpdate(dbRef(db, `jobs/${currentUser.id}/${editId}`), jobData);
+    } else {
+      const newJobRef = dbPush(dbRef(db, `jobs/${currentUser.id}`));
+      dbSet(newJobRef, jobData);
+      // Data baru membuat folder kembali berstatus belum diproses.
+      if (jobData.jenis) dbSet(dbRef(db, `folderStatuses/${currentUser.id}/job/${folderDbKey(jobData.jenis)}`), 'pending');
+    }
+
+    resetJobForm();
+    closeJobInputModal();
+    showJobFolderList();
+  });
+
+  function resetJobForm() {
+    document.getElementById('jobForm').reset();
+    document.getElementById('editJobId').value = "";
+    document.getElementById('jobBase64').value = "";
+    document.getElementById('jobPreviewContainer').style.display = 'none';
+    document.getElementById('tanggalPekerjaan').valueAsDate = new Date();
+    if (currentUser) {
+      document.getElementById('namaPekerja').value = currentUser.nama;
+    }
+
+    document.getElementById('jobFormTitle').textContent = "Catat Pekerjaan Baru";
+    document.getElementById('btnSubmitJob').textContent = "Simpan Pekerjaan";
+    document.getElementById('btnCancelJob').style.display = "none";
+  }
+
+  function showJobFolderList() {
+    activeJobFolderNama = "";
+    if (currentTabId === 'job-list-page') saveNavigationState();
+
+    document.getElementById('folderJobView').style.display = 'block';
+    document.getElementById('detailJobView').style.display = 'none';
+
+    const folderGrid = document.getElementById('folderJobGrid');
+    const emptyMsg = document.getElementById('emptyFolderJobMsg');
+    folderGrid.innerHTML = '';
+
+    const myJobs = currentUser ? (jobsMap[currentUser.id] || []) : [];
+    const groups = {};
+    myJobs.forEach(job => {
+      const key = job.jenis ? job.jenis.trim() : "";
+      if (!key) return;
+      const normalized = key.toLowerCase();
+      if (!groups[normalized]) groups[normalized] = { jenis: key, count: 0, people: new Set() };
+      groups[normalized].count += 1;
+      if (job.nama) groups[normalized].people.add(job.nama.trim());
+    });
+
+    const folders = Object.values(groups).sort((a,b) => a.jenis.localeCompare(b.jenis, 'id'));
+    if (folders.length === 0) {
+      emptyMsg.style.display = 'block';
+      return;
+    }
+    emptyMsg.style.display = 'none';
+
+    folders.forEach(folder => {
+      const card = document.createElement('div');
+      const processed = isFolderProcessed('job', folder.jenis);
+      card.className = 'folder-card' + (processed ? ' folder-processed' : '');
+      const safeJenis = folder.jenis.replace(/'/g, "\\'");
+      const peopleCount = folder.people.size;
+      card.innerHTML = `
+        <div onclick="openJobFolderDetail('${safeJenis}')" style="width:100%;">
+          <div class="folder-icon">📁</div>
+          <div class="folder-title">${folder.jenis}</div>
+          <div class="folder-count">${folder.count} Catatan • ${peopleCount} Pekerja</div>
+          <div class="folder-status-badge ${processed ? 'processed' : 'pending'}">${processed ? '✅ Sudah Diproses' : '⏳ Belum Diproses'}</div>
+        </div>
+        <button class="folder-status-btn" onclick="event.stopPropagation();openFolderStatusModal('job','${safeJenis}')">📌 Ubah Status</button>
+        <div class="folder-input-buttons"><button class="btn-folder-job" onclick="event.stopPropagation();openJobInputModal('${safeJenis}')">➕ Input Data</button><button class="btn-delete-folder" style="margin-top:0" onclick="event.stopPropagation();promptDeleteFolder('job','${safeJenis}')">🗑️ Hapus</button></div>
+      `;
+      folderGrid.appendChild(card);
+    });
+  }
+
+  function openJobFolderDetail(jenis) {
+    activeJobFolderNama = jenis;
+    currentTabId = 'job-list-page';
+    saveNavigationState();
+
+    document.getElementById('folderJobView').style.display = 'none';
+    document.getElementById('detailJobView').style.display = 'block';
+    document.getElementById('selectedJobFolderName').textContent = `Folder: ${jenis}`;
+
+    updateJobJenisFilterOptions();
+    renderJobCards();
+  }
+
+  function updateJobJenisFilterOptions() {
+    const filterSelect = document.getElementById('jobJenisFilter');
+    filterSelect.innerHTML = '<option value="ALL">Semua Jenis Pekerjaan</option>';
+    const opt = document.createElement('option');
+    opt.value = activeJobFolderNama;
+    opt.textContent = activeJobFolderNama;
+    filterSelect.appendChild(opt);
+    filterSelect.value = activeJobFolderNama;
+  }
+
+  function closeJobDetail() { showJobFolderList(); }
+
+  function getFilteredWorkerJobs() {
+    const sortOrder = document.getElementById('jobSortOrder').value;
+
+    let workerJobs = currentUser ? (jobsMap[currentUser.id] || []).filter(j =>
+      j.jenis && j.jenis.trim().toLowerCase() === activeJobFolderNama.toLowerCase()
+    ) : [];
+
+    // Urutan utama tetap berdasarkan Tanggal Pekerjaan.
+    // Jika tanggal sama, gunakan createdAt (waktu saat data dimasukkan/disimpan).
+    // Jam Mulai dan Jam Akhir TIDAK digunakan untuk pengurutan.
+    workerJobs.sort((a, b) => {
+      const dateA = new Date(a.tanggal || 0).getTime();
+      const dateB = new Date(b.tanggal || 0).getTime();
+      const dateDiff = dateB - dateA;
+
+      if (dateDiff !== 0) {
+        return sortOrder === 'DESC' ? dateDiff : -dateDiff;
+      }
+
+      const createdA = Number(a.createdAt) || (a.createdAt ? new Date(a.createdAt).getTime() : 0);
+      const createdB = Number(b.createdAt) || (b.createdAt ? new Date(b.createdAt).getTime() : 0);
+
+      if (createdA !== createdB) {
+        return sortOrder === 'DESC' ? createdB - createdA : createdA - createdB;
+      }
+
+      // Fallback stabil untuk data lama yang belum memiliki createdAt.
+      const idA = String(a.id || '');
+      const idB = String(b.id || '');
+      return sortOrder === 'DESC' ? idB.localeCompare(idA) : idA.localeCompare(idB);
+    });
+
+    return workerJobs;
+  }
+
+  function renderJobCards() {
+    const container = document.getElementById('jobCardListContainer');
+    const emptyMsg = document.getElementById('emptyJobDetailMsg');
+    container.innerHTML = '';
+
+    const workerJobs = getFilteredWorkerJobs();
+
+    if (workerJobs.length === 0) {
+      emptyMsg.style.display = 'block';
+      return;
+    }
+    emptyMsg.style.display = 'none';
+
+    workerJobs.forEach((job, index) => {
+      const row = document.createElement('tr');
+
+      const docHtml = job.dokumentasi
+        ? `<img src="${job.dokumentasi}" class="doc-thumb" onclick="openModal('${job.dokumentasi}')" alt="Bukti foto" style="width:56px;height:56px;object-fit:cover;border-radius:7px;cursor:pointer;">`
+        : `<span class="job-photo-empty">Tanpa Bukti</span>`;
+
+      row.innerHTML = `
+        <td class="col-no">${index + 1}</td>
+        <td class="col-photo">${docHtml}</td>
+        <td><strong>${job.jenis || '-'}</strong></td>
+        <td class="col-date">${job.tanggal || '-'}</td>
+        <td class="col-time">${job.jamMulai || '-'}</td>
+        <td class="col-time">${job.jamAkhir || '-'}</td>
+        <td>${job.keterangan || '-'}</td>
+        <td class="col-action">
+          <div class="job-action">
+            <button class="btn-edit" onclick="editJob('${job.id}')">✏️ Edit</button>
+            <button class="btn-delete" onclick="deleteJob('${job.id}')">🗑️ Hapus</button>
+          </div>
+        </td>
+      `;
+      container.appendChild(row);
+    });
+  }
+
+  function editJob(id) {
+    const userJobs = currentUser ? (jobsMap[currentUser.id] || []) : [];
+    const job = userJobs.find(j => j.id == id);
+    if (!job) return;
+
+    document.getElementById('editJobId').value = job.id;
+    document.getElementById('namaPekerja').value = job.nama || '';
+    document.getElementById('jenisPekerjaan').value = job.jenis || '';
+    document.getElementById('tanggalPekerjaan').value = job.tanggal || '';
+    document.getElementById('jamMulai').value = job.jamMulai || '';
+    document.getElementById('jamAkhir').value = job.jamAkhir || '';
+    document.getElementById('keteranganPekerjaan').value = job.keterangan || '';
+
+    if (job.dokumentasi) {
+      document.getElementById('jobBase64').value = job.dokumentasi;
+      document.getElementById('previewJobImg').src = job.dokumentasi;
+      document.getElementById('jobPreviewContainer').style.display = 'block';
+    } else {
+      document.getElementById('jobBase64').value = "";
+      document.getElementById('jobPreviewContainer').style.display = 'none';
+    }
+
+    document.getElementById('jobFormTitle').textContent = "Edit Catatan Pekerjaan";
+    document.getElementById('btnSubmitJob').textContent = "Perbarui Pekerjaan";
+    document.getElementById('btnCancelJob').style.display = "block";
+
+    document.getElementById('jobInputModal').style.display='flex';
+  }
+
+  function deleteJob(id) {
+    if (confirm('Hapus catatan pekerjaan ini?') && currentUser) {
+      dbRemove(dbRef(db, `jobs/${currentUser.id}/${id}`));
+    }
+  }
+
+  function exportJobToExcel() {
+    const list = getFilteredWorkerJobs();
+    if (list.length === 0) { alert("Tidak ada data untuk diexport!"); return; }
+
+    const exportData = list.map((item, index) => ({
+      "No": index + 1,
+      "Nama Personel": item.nama,
+      "Jenis Pekerjaan": item.jenis,
+      "Tanggal": item.tanggal,
+      "Jam Mulai": item.jamMulai || "-",
+      "Jam Akhir": item.jamAkhir || "-",
+      "Keterangan": item.keterangan || "-"
+    }));
+
+    const worksheet = XLSX.utils.json_to_sheet(exportData);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Catatan Pekerjaan");
+    XLSX.writeFile(workbook, `Pekerjaan_${activeJobFolderNama}.xlsx`);
+  }
+
+  function exportJobToPDF() {
+    const list = getFilteredWorkerJobs();
+    if (list.length === 0) { alert("Tidak ada data untuk diexport!"); return; }
+
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF();
+
+    doc.text(`Laporan Pekerjaan: ${activeJobFolderNama}`, 14, 15);
+
+    const tableColumn = ["No", "Nama Personel", "Jenis Pekerjaan", "Tanggal", "Jam Mulai", "Jam Akhir", "Keterangan"];
+    const tableRows = list.map((item, index) => [
+      index + 1, item.nama, item.jenis, item.tanggal, item.jamMulai || "-", item.jamAkhir || "-", item.keterangan || "-"
+    ]);
+
+    doc.autoTable({ head: [tableColumn], body: tableRows, startY: 22 });
+    doc.save(`Pekerjaan_${activeJobFolderNama}.pdf`);
+  }
+
+  /* --- PENGELUARAN & MODAL --- */
+  function toggleCapitalInput() {
+    const chk = document.getElementById('chkInputCapital');
+    const container = document.getElementById('capitalInputContainer');
+    container.style.display = chk.checked ? 'block' : 'none';
+  }
+
+  function onExpJenisChange() {
+    if (!currentUser) return;
+    const jenis = document.getElementById('expJenisPekerjaan').value.trim();
+    const userCapitals = capitalsMap[currentUser.id] || {};
+    if (userCapitals[jenis]) {
+      document.getElementById('jumlahModal').value = userCapitals[jenis];
+    } else {
+      document.getElementById('jumlahModal').value = "";
+    }
+  }
+
+  function populateJenisDatalist() {
+    const datalist = document.getElementById('jenisDatalist');
+    datalist.innerHTML = '';
+    if (!currentUser) return;
+    
+    const myJobs = jobsMap[currentUser.id] || [];
+    const myExp = expensesMap[currentUser.id] || [];
+
+    const jenisFromJobs = myJobs.map(j => j.jenis ? j.jenis.trim() : "").filter(Boolean);
+    const jenisFromExp = myExp.map(e => e.jenis ? e.jenis.trim() : "").filter(Boolean);
+    const allJenis = [...new Set([...jenisFromJobs, ...jenisFromExp])];
+
+    allJenis.forEach(jenis => {
+      const opt = document.createElement('option');
+      opt.value = jenis;
+      datalist.appendChild(opt);
+    });
+  }
+
+  document.getElementById('expenseForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    if (!currentUser) return;
+
+    const editId = document.getElementById('editExpenseId').value;
+    const jenisPekerjaan = document.getElementById('expJenisPekerjaan').value.trim();
+    const isCapitalChecked = document.getElementById('chkInputCapital').checked;
+
+    if (isCapitalChecked) {
+      const modalVal = parseFloat(document.getElementById('jumlahModal').value) || 0;
+      if (jenisPekerjaan) {
+        const safeKey = encodeURIComponent(jenisPekerjaan).replace(/\./g, '%2E');
+        dbSet(dbRef(db, `capitals/${currentUser.id}/${safeKey}`), modalVal);
+      }
+    }
+
+    const existingExp = editId ? (expensesMap[currentUser.id] || []).find(x => x.id == editId) : null;
+    const expData = {
+      namaUser: currentUser.nama,
+      jenis: jenisPekerjaan,
+      nama: document.getElementById('namaPengeluaran').value.trim(),
+      tanggal: document.getElementById('tanggalPengeluaran').value,
+      jumlah: parseFloat(document.getElementById('jumlahPengeluaran').value) || 0,
+      keterangan: document.getElementById('keteranganPengeluaran').value.trim(),
+      bukti: document.getElementById('expBase64').value,
+      createdAt: existingExp && existingExp.createdAt ? existingExp.createdAt : Date.now()
+    };
+
+    if (editId) {
+      dbUpdate(dbRef(db, `expenses/${currentUser.id}/${editId}`), expData);
+    } else {
+      const newExpRef = dbPush(dbRef(db, `expenses/${currentUser.id}`));
+      dbSet(newExpRef, expData);
+      if (expData.jenis) dbSet(dbRef(db, `folderStatuses/${currentUser.id}/expense/${folderDbKey(expData.jenis)}`), 'pending');
+    }
+
+    resetExpenseForm();
+    closeExpenseInputModal();
+    showExpenseFolderList();
+  });
+
+  function resetExpenseForm() {
+    document.getElementById('expenseForm').reset();
+    document.getElementById('editExpenseId').value = "";
+    document.getElementById('expBase64').value = "";
+    document.getElementById('expPreviewContainer').style.display = 'none';
+    document.getElementById('chkInputCapital').checked = false;
+    document.getElementById('capitalInputContainer').style.display = 'none';
+    document.getElementById('tanggalPengeluaran').valueAsDate = new Date();
+    if (currentUser) {
+      document.getElementById('namaPengeluaranUser').value = currentUser.nama;
+    }
+
+    document.getElementById('expFormTitle').textContent = "Catat Pengeluaran Baru / Input Modal";
+    document.getElementById('btnSubmitExp').textContent = "Simpan Transaksi";
+    document.getElementById('btnCancelExp').style.display = "none";
+  }
+
+  function openPersonalJobInputModal(folderJenis='') {
+    if (!currentUser) return;
+    resetPersonalJobForm();
+    if (folderJenis) document.getElementById('personalJenisPekerjaan').value = folderJenis;
+    document.getElementById('personalJobInputModal').style.display = 'flex';
+  }
+
+  function closePersonalJobInputModal() {
+    document.getElementById('personalJobInputModal').style.display = 'none';
+  }
+
+  document.getElementById('personalJobForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    if (!currentUser) return;
+    const editId = document.getElementById('editPersonalJobId').value;
+    const existing = editId ? (personalJobsMap[currentUser.id] || []).find(j => j.id == editId) : null;
+    const data = {
+      nama: currentUser.nama,
+      jenis: document.getElementById('personalJenisPekerjaan').value.trim(),
+      tanggal: document.getElementById('personalTanggalPekerjaan').value,
+      jamMulai: document.getElementById('personalJamMulai').value || '',
+      jamAkhir: document.getElementById('personalJamAkhir').value || '',
+      keterangan: document.getElementById('personalKeterangan').value.trim(),
+      dokumentasi: document.getElementById('personalJobBase64').value,
+      createdAt: existing && existing.createdAt ? existing.createdAt : Date.now()
+    };
+    if (editId) dbUpdate(dbRef(db, `personalJobs/${currentUser.id}/${editId}`), data);
+    else {
+      const r = dbPush(dbRef(db, `personalJobs/${currentUser.id}`));
+      dbSet(r, data);
+      if (data.jenis) dbSet(dbRef(db, `folderStatuses/${currentUser.id}/personal/${folderDbKey(data.jenis)}`), 'pending');
+    }
+    resetPersonalJobForm();
+    closePersonalJobInputModal();
+    showPersonalJobFolderList();
+  });
+
+  function resetPersonalJobForm() {
+    document.getElementById('personalJobForm').reset();
+    document.getElementById('editPersonalJobId').value = '';
+    document.getElementById('personalJobBase64').value = '';
+    document.getElementById('personalJobPreviewContainer').style.display = 'none';
+    document.getElementById('personalTanggalPekerjaan').valueAsDate = new Date();
+    document.getElementById('personalJobFormTitle').textContent = 'Catat Pekerjaan Pribadi Baru';
+    document.getElementById('btnSubmitPersonalJob').textContent = 'Simpan Pekerjaan';
+    document.getElementById('btnCancelPersonalJob').style.display = 'none';
+  }
+
+  function showPersonalJobFolderList() {
+    activePersonalJobFolderNama = '';
+    if (currentTabId === 'personal-job-list-page') saveNavigationState();
+    document.getElementById('folderPersonalJobView').style.display = 'block';
+    document.getElementById('detailPersonalJobView').style.display = 'none';
+    const grid = document.getElementById('folderPersonalJobGrid');
+    const empty = document.getElementById('emptyFolderPersonalJobMsg');
+    grid.innerHTML = '';
+    const records = currentUser ? (personalJobsMap[currentUser.id] || []) : [];
+    const groups = {};
+    records.forEach(job => {
+      const name = String(job.jenis || '').trim(); if (!name) return;
+      const key = normalizeFolderIdentifier(name);
+      if (!groups[key]) groups[key] = { name, count: 0 };
+      groups[key].count++;
+    });
+    const folders = Object.values(groups).sort((a,b) => a.name.localeCompare(b.name, 'id'));
+    if (!folders.length) { empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    folders.forEach(folder => {
+      const card = document.createElement('div');
+      const processed = isFolderProcessed('personal', folder.name);
+      card.className = 'folder-card' + (processed ? ' folder-processed' : '');
+      const safe = folder.name.replace(/'/g, "\\'");
+      card.innerHTML = `
+        <div onclick="openPersonalJobFolderDetail('${safe}')" style="width:100%;">
+          <div class="folder-icon">📁</div>
+          <div class="folder-title">${folder.name}</div>
+          <div class="folder-count">${folder.count} Catatan</div>
+          <div class="folder-status-badge ${processed ? 'processed' : 'pending'}">${processed ? '✅ Sudah Diproses' : '⏳ Belum Diproses'}</div>
+        </div>
+        <button class="folder-status-btn" onclick="event.stopPropagation();openFolderStatusModal('personal','${safe}')">📌 Ubah Status</button>
+        <div class="folder-input-buttons"><button class="btn-folder-job" onclick="event.stopPropagation();openPersonalJobInputModal('${safe}')">➕ Input Data</button><button class="btn-delete-folder" style="margin-top:0" onclick="event.stopPropagation();promptDeleteFolder('personal','${safe}')">🗑️ Hapus</button></div>
+      `;
+      grid.appendChild(card);
+    });
+  }
+
+  function openPersonalJobFolderDetail(jenis) {
+    activePersonalJobFolderNama = jenis;
+    currentTabId = 'personal-job-list-page';
+    saveNavigationState();
+    document.getElementById('folderPersonalJobView').style.display = 'none';
+    document.getElementById('detailPersonalJobView').style.display = 'block';
+    document.getElementById('selectedPersonalJobFolderName').textContent = `Folder: ${jenis}`;
+    renderPersonalJobTable();
+  }
+
+  function closePersonalJobDetail() { showPersonalJobFolderList(); }
+
+  function getFilteredPersonalJobs() {
+    const order = document.getElementById('personalJobSortOrder').value;
+    const list = currentUser ? (personalJobsMap[currentUser.id] || []).filter(j => j.jenis && normalizeFolderIdentifier(j.jenis) === normalizeFolderIdentifier(activePersonalJobFolderNama)) : [];
+    list.sort((a,b) => {
+      const d = new Date(a.tanggal) - new Date(b.tanggal);
+      if (d !== 0) return order === 'DESC' ? -d : d;
+      const ca = Number(a.createdAt) || 0, cb = Number(b.createdAt) || 0;
+      if (ca !== cb) return order === 'DESC' ? cb - ca : ca - cb;
+      return order === 'DESC' ? String(b.id||'').localeCompare(String(a.id||'')) : String(a.id||'').localeCompare(String(b.id||''));
+    });
+    return list;
+  }
+
+  function renderPersonalJobTable() {
+    const tbody = document.getElementById('personalJobTableBody');
+    const empty = document.getElementById('emptyPersonalJobDetailMsg');
+    tbody.innerHTML = '';
+    const list = getFilteredPersonalJobs();
+    if (!list.length) { empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    list.forEach((job,index) => {
+      const row = document.createElement('tr');
+      const photo = job.dokumentasi ? `<img src="${job.dokumentasi}" class="doc-thumb" onclick="openModal('${job.dokumentasi}')" alt="Bukti foto">` : `<span class="job-photo-empty">Tanpa Bukti</span>`;
+      row.innerHTML = `<td class="col-no">${index+1}</td><td class="col-photo">${photo}</td><td><strong>${job.jenis || '-'}</strong></td><td class="col-date">${job.tanggal || '-'}</td><td class="col-time">${job.jamMulai || '-'}</td><td class="col-time">${job.jamAkhir || '-'}</td><td>${job.keterangan || '-'}</td><td class="col-action"><div class="job-action"><button class="btn-edit" onclick="editPersonalJob('${job.id}')">✏️ Edit</button><button class="btn-delete" onclick="deletePersonalJob('${job.id}')">🗑️ Hapus</button></div></td>`;
+      tbody.appendChild(row);
+    });
+  }
+
+  function editPersonalJob(id) {
+    const job = (personalJobsMap[currentUser.id] || []).find(j => j.id == id); if (!job) return;
+    document.getElementById('editPersonalJobId').value = job.id;
+    document.getElementById('personalJenisPekerjaan').value = job.jenis || '';
+    document.getElementById('personalTanggalPekerjaan').value = job.tanggal || '';
+    document.getElementById('personalJamMulai').value = job.jamMulai || '';
+    document.getElementById('personalJamAkhir').value = job.jamAkhir || '';
+    document.getElementById('personalKeterangan').value = job.keterangan || '';
+    document.getElementById('personalJobBase64').value = job.dokumentasi || '';
+    document.getElementById('personalJobPreviewContainer').style.display = job.dokumentasi ? 'block' : 'none';
+    if (job.dokumentasi) document.getElementById('previewPersonalJobImg').src = job.dokumentasi;
+    document.getElementById('personalJobFormTitle').textContent = 'Edit Catatan Pekerjaan Pribadi';
+    document.getElementById('btnSubmitPersonalJob').textContent = 'Perbarui Pekerjaan';
+    document.getElementById('btnCancelPersonalJob').style.display = 'block';
+    document.getElementById('personalJobInputModal').style.display = 'flex';
+  }
+
+  function deletePersonalJob(id) {
+    if (confirm('Hapus catatan pekerjaan pribadi ini?') && currentUser) dbRemove(dbRef(db, `personalJobs/${currentUser.id}/${id}`));
+  }
+
+  function exportPersonalJobToExcel() {
+    const list = getFilteredPersonalJobs(); if (!list.length) { alert('Tidak ada data untuk diexport!'); return; }
+    const data = list.map((item,index) => ({No:index+1,'Nama Pekerjaan':item.jenis,Tanggal:item.tanggal,'Jam Mulai':item.jamMulai||'-','Jam Akhir':item.jamAkhir||'-',Keterangan:item.keterangan||'-'}));
+    const ws=XLSX.utils.json_to_sheet(data), wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,'Kerja Pribadi'); XLSX.writeFile(wb,`Kerja_Pribadi_${activePersonalJobFolderNama}.xlsx`);
+  }
+
+  function exportPersonalJobToPDF() {
+    const list=getFilteredPersonalJobs(); if(!list.length){alert('Tidak ada data untuk diexport!');return;}
+    const {jsPDF}=window.jspdf, doc=new jsPDF(); doc.text(`Laporan Kerja Pribadi: ${activePersonalJobFolderNama}`,14,15);
+    doc.autoTable({head:[['No','Nama Pekerjaan','Tanggal','Jam Mulai','Jam Akhir','Keterangan']],body:list.map((x,i)=>[i+1,x.jenis,x.tanggal,x.jamMulai||'-',x.jamAkhir||'-',x.keterangan||'-']),startY:22}); doc.save(`Kerja_Pribadi_${activePersonalJobFolderNama}.pdf`);
+  }
+
+  function showExpenseFolderList() {
+    activeExpFolderJenis = "";
+    if (currentTabId === 'expense-list-page') saveNavigationState();
+
+    document.getElementById('folderExpView').style.display = 'block';
+    document.getElementById('detailExpView').style.display = 'none';
+
+    const folderGrid = document.getElementById('folderExpGrid');
+    const emptyMsg = document.getElementById('emptyFolderExpMsg');
+    folderGrid.innerHTML = '';
+
+    const myExpenses = currentUser ? (expensesMap[currentUser.id] || []) : [];
+    const userCapitals = currentUser ? (capitalsMap[currentUser.id] || {}) : {};
+
+    const group = {};
+    myExpenses.forEach(exp => {
+      const key = exp.jenis ? exp.jenis.trim() : "";
+      if (key) {
+        if (!group[key]) group[key] = { count: 0, total: 0 };
+        group[key].count += 1;
+        group[key].total += exp.jumlah || 0;
+      }
+    });
+
+    const uniqueJenis = Object.keys(group);
+    if (uniqueJenis.length === 0) {
+      emptyMsg.style.display = 'block';
+      return;
+    }
+    emptyMsg.style.display = 'none';
+
+    uniqueJenis.forEach(jenis => {
+      const card = document.createElement('div');
+      const processed = isFolderProcessed('expense', jenis);
+      card.className = 'folder-card expense-card' + (processed ? ' folder-processed' : '');
+      const safeJenis = jenis.replace(/'/g, "\\'");
+      const capVal = userCapitals[jenis] || 0;
+
+      card.innerHTML = `
+        <div onclick="openExpenseFolderDetail('${safeJenis}')" style="width:100%;">
+          <div class="folder-icon">📂</div>
+          <div class="folder-title">${jenis}</div>
+          <div class="folder-count">${group[jenis].count} Transaksi</div>
+          ${capVal > 0 ? `<div class="capital-badge">Modal: ${formatRupiah(capVal)}</div><br>` : ''}
+          <div class="total-badge">Terpakai: ${formatRupiah(group[jenis].total)}</div>
+          <div class="folder-status-badge ${processed ? 'processed' : 'pending'}">${processed ? '✅ Sudah Diproses' : '⏳ Belum Diproses'}</div>
+        </div>
+        <button class="folder-status-btn" onclick="event.stopPropagation();openFolderStatusModal('expense','${safeJenis}')">📌 Ubah Status</button>
+        <div class="folder-input-buttons"><button class="btn-folder-expense" onclick="event.stopPropagation();openExpenseInputModal('${safeJenis}')">➕ Input Data</button><button class="btn-delete-folder" style="margin-top:0" onclick="event.stopPropagation();promptDeleteFolder('expense','${safeJenis}')">🗑️ Hapus</button></div>
+      `;
+      folderGrid.appendChild(card);
+    });
+  }
+
+  function openExpenseFolderDetail(jenis) {
+    activeExpFolderJenis = jenis;
+    currentTabId = 'expense-list-page';
+    saveNavigationState();
+
+    document.getElementById('folderExpView').style.display = 'none';
+    document.getElementById('detailExpView').style.display = 'block';
+    document.getElementById('selectedExpFolderName').textContent = `Folder: ${jenis}`;
+
+    updateExpenseNamaFilterOptions();
+    renderExpenseDetailTable();
+  }
+
+  function updateExpenseNamaFilterOptions() {
+    const filterSelect = document.getElementById('expNamaFilter');
+    const selectedVal = filterSelect.value;
+
+    const folderExpenses = currentUser ? (expensesMap[currentUser.id] || []).filter(e => e.jenis && e.jenis.trim().toLowerCase() === activeExpFolderJenis.toLowerCase()) : [];
+    const uniqueNama = [...new Set(folderExpenses.map(e => e.nama ? e.nama.trim() : ""))].filter(Boolean);
+
+    filterSelect.innerHTML = '<option value="ALL">Semua Nama Pengeluaran</option>';
+    uniqueNama.forEach(nama => {
+      const opt = document.createElement('option');
+      opt.value = nama;
+      opt.textContent = nama;
+      filterSelect.appendChild(opt);
+    });
+
+    if (uniqueNama.includes(selectedVal)) {
+      filterSelect.value = selectedVal;
+    } else {
+      filterSelect.value = 'ALL';
+    }
+  }
+
+  function closeExpenseDetail() { showExpenseFolderList(); }
+
+  function getFilteredExpenses() {
+    const sortOrder = document.getElementById('expSortOrder').value;
+    const selectedNama = document.getElementById('expNamaFilter').value;
+
+    let filteredExp = currentUser ? (expensesMap[currentUser.id] || []).filter(e => e.jenis && e.jenis.trim().toLowerCase() === activeExpFolderJenis.toLowerCase()) : [];
+
+    if (selectedNama !== 'ALL') {
+      filteredExp = filteredExp.filter(e => e.nama && e.nama.trim().toLowerCase() === selectedNama.toLowerCase());
+    }
+
+    filteredExp.sort((a, b) => {
+      const dateA = new Date(a.tanggal);
+      const dateB = new Date(b.tanggal);
+      return sortOrder === 'DESC' ? dateB - dateA : dateA - dateB;
+    });
+
+    return filteredExp;
+  }
+
+  function renderExpenseDetailTable() {
+    const tbody = document.getElementById('expenseTableBody');
+    const emptyMsg = document.getElementById('emptyExpDetailMsg');
+    tbody.innerHTML = '';
+
+    const filteredExp = getFilteredExpenses();
+    let totalSum = 0;
+
+    if (filteredExp.length === 0) {
+      emptyMsg.style.display = 'block';
+    } else {
+      emptyMsg.style.display = 'none';
+
+      filteredExp.forEach((exp, index) => {
+        totalSum += exp.jumlah || 0;
+        const tr = document.createElement('tr');
+        const buktiHtml = exp.bukti 
+          ? `<img src="${exp.bukti}" class="doc-thumb" onclick="openModal('${exp.bukti}')">`
+          : `<span style="color:#94a3b8; font-style:italic;">Tanpa Bukti</span>`;
+
+        tr.innerHTML = `
+          <td>${index + 1}</td>
+          <td>${buktiHtml}</td>
+          <td>${exp.nama || '-'}</td>
+          <td>${exp.tanggal || '-'}</td>
+          <td class="amount-text">${formatRupiah(exp.jumlah || 0)}</td>
+          <td>${exp.keterangan || '-'}</td>
+          <td>
+            <div class="action-btns">
+              <button class="btn-edit" onclick="editExpense('${exp.id}')">✏️ Edit</button>
+              <button class="btn-delete" onclick="deleteExpense('${exp.id}')">🗑️ Hapus</button>
+            </div>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+
+    const userCapitals = currentUser ? (capitalsMap[currentUser.id] || {}) : {};
+    const currentCapital = userCapitals[activeExpFolderJenis] || 0;
+    const remaining = currentCapital - totalSum;
+
+    document.getElementById('totalCapitalAmount').textContent = formatRupiah(currentCapital);
+    document.getElementById('totalExpAmount').textContent = formatRupiah(totalSum);
+    
+    const remEl = document.getElementById('remainingCapitalAmount');
+    remEl.textContent = formatRupiah(remaining);
+    remEl.className = remaining < 0 ? 'summary-value text-danger' : 'summary-value text-primary';
+  }
+
+  function editExpense(id) {
+    const userExpenses = currentUser ? (expensesMap[currentUser.id] || []) : [];
+    const exp = userExpenses.find(e => e.id == id);
+    if (!exp) return;
+
+    document.getElementById('editExpenseId').value = exp.id;
+    document.getElementById('expJenisPekerjaan').value = exp.jenis || '';
+    document.getElementById('namaPengeluaran').value = exp.nama || '';
+    document.getElementById('tanggalPengeluaran').value = exp.tanggal || '';
+    document.getElementById('jumlahPengeluaran').value = exp.jumlah || 0;
+    document.getElementById('keteranganPengeluaran').value = exp.keterangan || '';
+
+    const userCapitals = currentUser ? (capitalsMap[currentUser.id] || {}) : {};
+    if (exp.jenis && userCapitals[exp.jenis]) {
+      document.getElementById('chkInputCapital').checked = true;
+      toggleCapitalInput();
+      document.getElementById('jumlahModal').value = userCapitals[exp.jenis];
+    }
+
+    if (exp.bukti) {
+      document.getElementById('expBase64').value = exp.bukti;
+      document.getElementById('previewExpImg').src = exp.bukti;
+      document.getElementById('expPreviewContainer').style.display = 'block';
+    } else {
+      document.getElementById('expBase64').value = "";
+      document.getElementById('expPreviewContainer').style.display = 'none';
+    }
+
+    document.getElementById('expFormTitle').textContent = "Edit Catatan Pengeluaran";
+    document.getElementById('btnSubmitExp').textContent = "Perbarui Transaksi";
+    document.getElementById('btnCancelExp').style.display = "block";
+
+    document.getElementById('expenseInputModal').style.display='flex';
+  }
+
+  function deleteExpense(id) {
+    if (confirm('Hapus pengeluaran ini?') && currentUser) {
+      dbRemove(dbRef(db, `expenses/${currentUser.id}/${id}`));
+    }
+  }
+
+  function exportExpenseToExcel() {
+    const list = getFilteredExpenses();
+    if (list.length === 0) { alert("Tidak ada data untuk diexport!"); return; }
+
+    let total = 0;
+    const userCapitals = currentUser ? (capitalsMap[currentUser.id] || {}) : {};
+    const currentCap = userCapitals[activeExpFolderJenis] || 0;
+
+    const exportData = list.map((item, index) => {
+      total += item.jumlah || 0;
+      return {
+        "No": index + 1,
+        "Jenis Pekerjaan": item.jenis,
+        "Nama Pengeluaran": item.nama,
+        "Tanggal": item.tanggal,
+        "Jumlah (Rp)": item.jumlah,
+        "Keterangan": item.keterangan || "-"
+      };
+    });
+
+    exportData.push({ "No": "", "Jenis Pekerjaan": "", "Nama Pengeluaran": "TOTAL MODAL", "Tanggal": "", "Jumlah (Rp)": currentCap, "Keterangan": "" });
+    exportData.push({ "No": "", "Jenis Pekerjaan": "", "Nama Pengeluaran": "TOTAL TERPAKAI", "Tanggal": "", "Jumlah (Rp)": total, "Keterangan": "" });
+    exportData.push({ "No": "", "Jenis Pekerjaan": "", "Nama Pengeluaran": "SISA MODAL", "Tanggal": "", "Jumlah (Rp)": currentCap - total, "Keterangan": "" });
+
+    const worksheet = XLSX.utils.json_to_sheet(exportData);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Pengeluaran");
+    XLSX.writeFile(workbook, `Pengeluaran_${activeExpFolderJenis}.xlsx`);
+  }
+
+  function exportExpenseToPDF() {
+    const list = getFilteredExpenses();
+    if (list.length === 0) { alert("Tidak ada data untuk diexport!"); return; }
+
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF();
+
+    doc.text(`Laporan Pengeluaran: ${activeExpFolderJenis}`, 14, 15);
+
+    let total = 0;
+    const userCapitals = currentUser ? (capitalsMap[currentUser.id] || {}) : {};
+    const currentCap = userCapitals[activeExpFolderJenis] || 0;
+
+    const tableColumn = ["No", "Nama Pengeluaran", "Tanggal", "Jumlah (Rp)", "Keterangan"];
+    const tableRows = list.map((item, index) => {
+      total += item.jumlah || 0;
+      return [index + 1, item.nama, item.tanggal, formatRupiah(item.jumlah || 0), item.keterangan || "-"];
+    });
+
+    tableRows.push(["", "TOTAL MODAL", "", formatRupiah(currentCap), ""]);
+    tableRows.push(["", "TOTAL TERPAKAI", "", formatRupiah(total), ""]);
+    tableRows.push(["", "SISA MODAL", "", formatRupiah(currentCap - total), ""]);
+
+    doc.autoTable({ head: [tableColumn], body: tableRows, startY: 22 });
+    doc.save(`Pengeluaran_${activeExpFolderJenis}.pdf`);
+  }
+
+  function promptDeleteFolder(type, identifier) {
+    folderToDelete.type = type;
+    folderToDelete.identifier = identifier;
+
+    const titleEl = document.getElementById('deleteFolderModalTitle');
+    const descEl = document.getElementById('deleteFolderModalDesc');
+
+    if (type === 'job') {
+      titleEl.textContent = `Hapus Folder Kerja "${identifier}"?`;
+      descEl.textContent = `Seluruh catatan kerja untuk folder ${identifier} akan dihapus secara permanen.`;
+    } else if (type === 'personal') {
+      titleEl.textContent = `Hapus Folder Kerja Pribadi "${identifier}"?`;
+      descEl.textContent = `Seluruh catatan kerja pribadi untuk folder ${identifier} akan dihapus secara permanen.`;
+    } else if (type === 'expense') {
+      titleEl.textContent = `Hapus Folder Pengeluaran "${identifier}"?`;
+      descEl.textContent = `Seluruh catatan pengeluaran untuk jenis pekerjaan "${identifier}" akan dihapus secara permanen.`;
+    }
+
+    document.getElementById('deleteFolderModal').style.display = 'flex';
+  }
+
+  function closeDeleteFolderModal() {
+    document.getElementById('deleteFolderModal').style.display = 'none';
+    folderToDelete = { type: null, identifier: null };
+  }
+
+  document.getElementById('btnConfirmDeleteFolder').addEventListener('click', function() {
+    if (!folderToDelete.type || !folderToDelete.identifier || !currentUser) return;
+
+    const targetIdentifier = folderToDelete.identifier.trim().toLowerCase();
+
+    if (folderToDelete.type === 'personal') {
+      const records = personalJobsMap[currentUser.id] || [];
+      records.forEach(job => { if (normalizeFolderIdentifier(job.jenis) === targetIdentifier) dbRemove(dbRef(db, `personalJobs/${currentUser.id}/${job.id}`)); });
+      dbRemove(dbRef(db, `folderStatuses/${currentUser.id}/personal/${folderDbKey(folderToDelete.identifier)}`));
+      showPersonalJobFolderList();
+    } else if (folderToDelete.type === 'job') {
+      const userJobs = jobsMap[currentUser.id] || [];
+      userJobs.forEach(job => {
+        if (job.jenis && job.jenis.trim().toLowerCase() === targetIdentifier) {
+          dbRemove(dbRef(db, `jobs/${currentUser.id}/${job.id}`));
+        }
+      });
+      dbRemove(dbRef(db, `folderStatuses/${currentUser.id}/job/${folderDbKey(folderToDelete.identifier)}`));
+      showJobFolderList();
+    } else if (folderToDelete.type === 'expense') {
+      const userExpenses = expensesMap[currentUser.id] || [];
+      userExpenses.forEach(exp => {
+        if (exp.jenis && exp.jenis.trim().toLowerCase() === targetIdentifier) {
+          dbRemove(dbRef(db, `expenses/${currentUser.id}/${exp.id}`));
+        }
+      });
+      const safeKey = encodeURIComponent(folderToDelete.identifier).replace(/\./g, '%2E');
+      dbRemove(dbRef(db, `capitals/${currentUser.id}/${safeKey}`));
+      dbRemove(dbRef(db, `folderStatuses/${currentUser.id}/expense/${folderDbKey(folderToDelete.identifier)}`));
+      showExpenseFolderList();
+    }
+
+    closeDeleteFolderModal();
+  });
+
+  function openModal(imgSrc) {
+    document.getElementById('modalImg').src = imgSrc;
+    document.getElementById('photoModal').style.display = 'flex';
+  }
+
+  function closeModal() {
+    document.getElementById('photoModal').style.display = 'none';
+  }
+
+  document.getElementById('tanggalPekerjaan').valueAsDate = new Date();
+  document.getElementById('tanggalPengeluaran').valueAsDate = new Date();
+
+  window.addEventListener('DOMContentLoaded', () => {
+    // Pulihkan sesi lokal sebelum menunggu Firebase agar refresh offline tidak kembali ke login.
+    currentTabId = 'dashboard-page';
+    checkSavedSession();
+
+    // Sync Users
+    dbOnValue(dbRef(db, 'users'), (snapshot) => {
+      const data = snapshot.val();
+      users = [];
+      if (data) {
+        Object.keys(data).forEach(key => {
+          users.push({ id: key, ...data[key] });
+        });
+      }
+      renderUserTableAndLoginSelect();
+      checkSavedSession();
+      restoreNavigationState();
+    });
+
+    // Sync Jobs (Per-User Structure)
+    dbOnValue(dbRef(db, 'jobs'), (snapshot) => {
+      const data = snapshot.val();
+      jobsMap = {};
+      if (data) {
+        Object.keys(data).forEach(userId => {
+          jobsMap[userId] = [];
+          const userJobsObj = data[userId];
+          if (userJobsObj) {
+            Object.keys(userJobsObj).forEach(jobId => {
+              jobsMap[userId].push({ id: jobId, ...userJobsObj[jobId] });
+            });
+          }
+        });
+      }
+      renderDashboard();
+      refreshCurrentView();
+    });
+
+    // Sync Expenses (Per-User Structure)
+    dbOnValue(dbRef(db, 'expenses'), (snapshot) => {
+      const data = snapshot.val();
+      expensesMap = {};
+      if (data) {
+        Object.keys(data).forEach(userId => {
+          expensesMap[userId] = [];
+          const userExpObj = data[userId];
+          if (userExpObj) {
+            Object.keys(userExpObj).forEach(expId => {
+              expensesMap[userId].push({ id: expId, ...userExpObj[expId] });
+            });
+          }
+        });
+      }
+      renderDashboard();
+      refreshCurrentView();
+    });
+
+    // Sync Pekerjaan Pribadi (Per-User Structure)
+    dbOnValue(dbRef(db, 'personalJobs'), (snapshot) => {
+      const data = snapshot.val();
+      personalJobsMap = {};
+      if (data) {
+        Object.keys(data).forEach(userId => {
+          personalJobsMap[userId] = [];
+          const obj = data[userId];
+          if (obj) Object.keys(obj).forEach(id => personalJobsMap[userId].push({ id, ...obj[id] }));
+        });
+      }
+      renderDashboard();
+      refreshCurrentView();
+    });
+
+    // Sync Status Folder: job / personal / expense
+    dbOnValue(dbRef(db, 'folderStatuses'), (snapshot) => {
+      const data = snapshot.val() || {};
+      jobFolderStatusMap = {};
+      personalJobFolderStatusMap = {};
+      expenseFolderStatusMap = {};
+      Object.keys(data).forEach(userId => {
+        const user = data[userId] || {};
+        jobFolderStatusMap[userId] = {};
+        personalJobFolderStatusMap[userId] = {};
+        expenseFolderStatusMap[userId] = {};
+        const parseType = (obj, target) => {
+          if (!obj) return;
+          Object.keys(obj).forEach(encoded => {
+            let decoded = encoded;
+            try { decoded = decodeURIComponent(encoded); } catch (e) {}
+            target[normalizeFolderIdentifier(decoded)] = obj[encoded] || 'pending';
+          });
+        };
+        parseType(user.job, jobFolderStatusMap[userId]);
+        parseType(user.personal, personalJobFolderStatusMap[userId]);
+        parseType(user.expense, expenseFolderStatusMap[userId]);
+      });
+      renderDashboard();
+      refreshCurrentView();
+    });
+
+    // Sync Capitals (Per-User Structure)
+    dbOnValue(dbRef(db, 'capitals'), (snapshot) => {
+      const data = snapshot.val();
+      capitalsMap = {};
+      if (data) {
+        Object.keys(data).forEach(userId => {
+          capitalsMap[userId] = {};
+          const userCapObj = data[userId];
+          if (userCapObj) {
+            Object.keys(userCapObj).forEach(key => {
+              const decodedKey = decodeURIComponent(key);
+              capitalsMap[userId][decodedKey] = userCapObj[key];
+            });
+          }
+        });
+      }
+      renderDashboard();
+      refreshCurrentView();
+    });
+  });
+</script>
+
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./service-worker.js', { scope: './' })
+          .then(reg => console.log('KerjaKu PWA aktif:', reg.scope))
+          .catch(err => console.error('Service Worker gagal:', err));
+      });
+    }
+  </script>
+
+  <div id="kerjakuConnectionStatus" role="status" aria-live="polite"
+       style="position:fixed;bottom:8px;left:50%;transform:translateX(-50%);z-index:99999;
+       padding:7px 12px;border-radius:999px;background:#166534;color:#fff;font:12px sans-serif;
+       box-shadow:0 2px 8px #0002;max-width:92vw;text-align:center">
+    Memeriksa koneksi…
+  </div>
+  <script>
+    (function () {
+      const el = document.getElementById('kerjakuConnectionStatus');
+      function refreshStatus() {
+        const online = navigator.onLine;
+        const pending = window.kerjaKuOffline ? window.kerjaKuOffline.pendingCount() : 0;
+        el.textContent = (online ? 'Online' : 'Offline') + ' · antrean perubahan: ' + pending;
+        el.style.background = online ? (pending ? '#92400e' : '#166534') : '#991b1b';
+      }
+      window.addEventListener('online', refreshStatus);
+      window.addEventListener('offline', refreshStatus);
+      window.addEventListener('kerjaku-offline-queue', refreshStatus);
+      setInterval(refreshStatus, 3000);
+      window.addEventListener('load', refreshStatus);
+    })();
+  </script>
+
+</body>
+</html>
